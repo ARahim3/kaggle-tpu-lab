@@ -85,10 +85,12 @@ python launch.py serve --keepalive-min 120                       # auto-stop aft
 
 ## Quick start B — as a Kaggle notebook
 
-Prefer clicking? Open [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb)
-in Kaggle (upload it, or copy the published version), set **Accelerator = TPU VM v5e-8**,
-**Internet = ON**, attach the two datasets named in the first cell, and run top to bottom.
-The last cell *is* the server — the endpoint URL and API key appear in its output.
+Prefer clicking? Copy the published Kaggle notebook —
+[**kaggle.com/code/rahim3/qwen38-tpu-serve**](https://www.kaggle.com/code/rahim3/qwen38-tpu-serve)
+— or upload [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb) yourself.
+Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets named in
+the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
+and API key appear in its output.
 
 ## Using it with coding agents
 
