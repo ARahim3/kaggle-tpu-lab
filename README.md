@@ -88,8 +88,9 @@ The last cell *is* the server — the endpoint URL and API key appear in its out
 ## Using it with coding agents
 
 The endpoint is standard OpenAI API, with tool calling enabled
-(`--enable-auto-tool-choice`, hermes parser) and the `qwen3` reasoning parser, so
-thinking content is separated properly.
+(`--enable-auto-tool-choice`, `qwen3_coder` parser — matches Qwen3.8's XML tool format)
+and the `qwen3` reasoning parser, so thinking content is separated properly. The
+launcher/notebook print the endpoint URL and API key in a banner when the server is up.
 
 **Codex CLI / opencode / aider / anything OpenAI-compatible:**
 
@@ -99,17 +100,18 @@ export OPENAI_API_KEY="sk-<your-key>"
 # model name: qwen3.8-27b
 ```
 
-**Claude Code** — the bundled vLLM also exposes an Anthropic-compatible API, so:
+**Claude Code** — the bundled vLLM also exposes an Anthropic-compatible `/v1/messages`
+(reasoning arrives as proper `thinking` blocks; we verified Claude Code end-to-end
+against it). One gotcha: the server authenticates with a Bearer header only, so use
+`ANTHROPIC_AUTH_TOKEN`, **not** `ANTHROPIC_API_KEY`:
 
 ```bash
 export ANTHROPIC_BASE_URL="https://<your-tunnel>.trycloudflare.com"
-export ANTHROPIC_API_KEY="sk-<your-key>"
+export ANTHROPIC_AUTH_TOKEN="sk-<your-key>"
 export ANTHROPIC_MODEL="qwen3.8-27b"
+export ANTHROPIC_SMALL_FAST_MODEL="qwen3.8-27b"
 claude
 ```
-
-(If your vLLM build lacks the Anthropic route, put [LiteLLM](https://github.com/BerriAI/litellm)
-in front — one-liner proxy from Anthropic to OpenAI format.)
 
 ### Reasoning effort
 
