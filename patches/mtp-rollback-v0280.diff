@@ -1,0 +1,671 @@
+diff --git a/tpu_inference/layers/common/attention_metadata.py b/tpu_inference/layers/common/attention_metadata.py
+index 7b1ad95..df04c6c 100644
+--- a/tpu_inference/layers/common/attention_metadata.py
++++ b/tpu_inference/layers/common/attention_metadata.py
+@@ -55,6 +55,8 @@ class PCPMetadata:
+         "query_start_loc",
+         "request_distribution",
+         "mamba_state_indices",
++        "mamba_slot_read_offsets",
++        "mamba_request_distribution",
+         "pcp",
+     ],
+     meta_fields=["padded_num_reqs", "pcp_cache_pages"],
+@@ -80,6 +82,17 @@ class AttentionMetadata(object):
+     # None for models without mamba layers; pure-mamba models would also
+     # use this field, only hybrid models exercise it today.
+     mamba_state_indices: jax.Array | None = None
++    # (mamba_num_blocks,) int32 — mamba + spec decode only, else None. Per-slot
++    # state read offset (num_accepted - 1 from the last verify step): the GDN
++    # kernel resumes from checkpoint `base_slot + offset` and writes new
++    # checkpoints from `base_slot`. Indexed by physical slot so it survives
++    # rescheduling.
++    mamba_slot_read_offsets: jax.Array | None = None
++    # (3 * dp_size,) int32 — mamba + spec decode only, else None. Like
++    # `request_distribution`, but its first segment counts all windowed
++    # sequences (decodes + verify windows), so the GDN kernel runs its windowed
++    # mode over the [decode][verify] prefix of the batch.
++    mamba_request_distribution: jax.Array | None = None
+ 
+     # PCP-specific metadata. None when not running prefill context parallelism.
+     pcp: PCPMetadata | None = None
+diff --git a/tpu_inference/layers/common/gdn_attention.py b/tpu_inference/layers/common/gdn_attention.py
+index a899bda..ca2bc93 100644
+--- a/tpu_inference/layers/common/gdn_attention.py
++++ b/tpu_inference/layers/common/gdn_attention.py
+@@ -15,7 +15,6 @@
+ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
+ 
+ """
+-import functools
+ from typing import Optional, Tuple
+ 
+ import jax
+@@ -47,6 +46,8 @@ def run_jax_gdn_attention(
+     d_v: int,
+     kernel_size: int,
+     mesh: jax.sharding.Mesh,
++    slot_read_offsets: Optional[jnp.ndarray] = None,
++    num_spec_tokens: int = 0,
+ ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+     """Runs the Jax GDN attention mechanism.
+ 
+@@ -81,6 +82,11 @@ def run_jax_gdn_attention(
+         kernel_size: Convolution kernel size.
+         mesh: The device mesh for distributed computation.
+         config: Configuration for implementation selection.
++        slot_read_offsets: Optional `(num_blocks,)` per-slot mamba read offset
++          for spec decoding, gathered per request as
++          `slot_read_offsets[state_indices]`. Required iff `num_spec_tokens > 0`.
++        num_spec_tokens: Number of speculative draft tokens (0 disables the
++          spec-decode windowed mode).
+ 
+     Returns:
+         A tuple containing:
+@@ -108,6 +114,10 @@ def run_jax_gdn_attention(
+         P(ShardingAxisName.ATTN_DATA),  # distribution
+         P(ShardingAxisName.ATTN_DATA),  # seq_lens
+     )
++    # slot_read_offsets is an optional operand: when absent it is passed as
++    # None with a matching None spec (no sharded array).
++    in_specs = in_specs + (P(ShardingAxisName.ATTN_DATA) if slot_read_offsets
++                           is not None else None, )  # slot_read_offsets
+ 
+     out_specs = (
+         (
+@@ -121,14 +131,39 @@ def run_jax_gdn_attention(
+ 
+     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+ 
+-    p_run_jax_gdn_attention_local = functools.partial(
+-        wrapper.fused_conv1d_gdn,
+-        n_kq=n_kq // tp_size,
+-        n_v=n_v // tp_size,
+-        d_k=d_k,
+-        d_v=d_v,
+-        kernel_size=kernel_size,
+-    )
++    def p_run_jax_gdn_attention_local(j_mixed_qkv, j_b, j_a, conv_state,
++                                      recurrent_state, j_conv_weight,
++                                      j_conv_bias, j_A_log, j_dt_bias,
++                                      query_start_loc, state_indices,
++                                      distribution, seq_lens,
++                                      slot_read_offsets):
++        read_offsets = None
++        if slot_read_offsets is not None:
++            # `state_indices` are rank-local base slots; `slot_read_offsets`
++            # is the rank-local shard of the per-slot offset buffer.
++            read_offsets = slot_read_offsets[state_indices]
++        return wrapper.fused_conv1d_gdn(
++            j_mixed_qkv,
++            j_b,
++            j_a,
++            conv_state,
++            recurrent_state,
++            j_conv_weight,
++            j_conv_bias,
++            j_A_log,
++            j_dt_bias,
++            query_start_loc,
++            state_indices,
++            distribution,
++            seq_lens,
++            read_offsets,
++            n_kq=n_kq // tp_size,
++            n_v=n_v // tp_size,
++            d_k=d_k,
++            d_v=d_v,
++            kernel_size=kernel_size,
++            num_spec_tokens=num_spec_tokens,
++        )
+ 
+     mapped_fn = jax.shard_map(
+         p_run_jax_gdn_attention_local,
+@@ -152,6 +187,7 @@ def run_jax_gdn_attention(
+         state_indices,
+         distribution,
+         seq_lens,
++        slot_read_offsets,
+     )
+ 
+     return (new_conv_state, new_recurrent_state), output
+diff --git a/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py b/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
+index 1d740e7..4f38abe 100644
+--- a/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
++++ b/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
+@@ -68,6 +68,13 @@ def gdn_attention_core_tpu(
+     query_start_loc = first_attn_metadata.query_start_loc
+     seq_lens = first_attn_metadata.seq_lens
+     state_indices = first_attn_metadata.mamba_state_indices
++    slot_read_offsets = first_attn_metadata.mamba_slot_read_offsets
++    if first_attn_metadata.mamba_request_distribution is not None:
++        # Spec decoding: the GDN windowed segment covers both 1-token
++        # decodes and speculative verify windows (the batch is ordered
++        # [decode][verify][prefill/mixed]); RPA keeps using
++        # `request_distribution` with its 1-token decode front segment.
++        request_distribution = first_attn_metadata.mamba_request_distribution
+ 
+     layer_module = fc.no_compile_layers[layer_name]
+     vllm_context = get_vllm_model_wrapper_context()
+@@ -109,6 +116,20 @@ def gdn_attention_core_tpu(
+     else:
+         conv_state_in = conv_state
+ 
++    # Speculative decoding: vLLM's MambaSpec widens the conv state by
++    # `num_spec` columns, so the number of draft tokens is statically
++    # recoverable from the allocated shape. The extra columns themselves are
++    # unused on TPU (rollback keeps one full checkpoint per group slot
++    # instead of a rolling window); only the first kernel_size - 1 columns
++    # per slot hold data.
++    num_spec_tokens = 0
++    if slot_read_offsets is not None:
++        num_spec_tokens = state_len - (kernel_size - 1)
++        assert num_spec_tokens > 0, (
++            "mamba_slot_read_offsets is set but the conv state has no "
++            f"speculative columns (state_len={state_len}, "
++            f"kernel_size={kernel_size})")
++
+     # Index mamba state by the per-request slot id from
+     # `InputBatch.mamba_state_indices_cpu`, not by `block_tables[:, 0]`
+     # (vLLM's GPU convention). Two reasons:
+@@ -156,6 +177,8 @@ def gdn_attention_core_tpu(
+          d_v,
+          kernel_size,
+          mesh=mesh,
++         slot_read_offsets=slot_read_offsets,
++         num_spec_tokens=num_spec_tokens,
+      )
+     if state_len > kernel_size - 1:
+         remaining_old_state = conv_state[:, kernel_size - 1:, :]
+diff --git a/tpu_inference/runner/compilation_manager.py b/tpu_inference/runner/compilation_manager.py
+index 3a35d19..6169f1e 100644
+--- a/tpu_inference/runner/compilation_manager.py
++++ b/tpu_inference/runner/compilation_manager.py
+@@ -442,6 +442,16 @@ class CompilationManager:
+                                                sharding=metadata_attn_sharding)
+         else:
+             mamba_state_indices = None
++        # Match `_prepare_inputs`: the spec-decode mamba fields are set iff
++        # the model has mamba layers and spec decoding is enabled.
++        mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
++        if mamba_slot_read_offsets is not None:
++            mamba_request_distribution = device_array(
++                self.runner.mesh,
++                np.array([0, 0, 0] * dp_size, dtype=np.int32),
++                sharding=metadata_attn_sharding)
++        else:
++            mamba_request_distribution = None
+ 
+         def build_block_table(kv_cache_gid: int) -> jax.Array:
+             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
+@@ -462,6 +472,8 @@ class CompilationManager:
+                 query_start_loc=query_start_loc,
+                 request_distribution=request_distribution,
+                 mamba_state_indices=mamba_state_indices,
++                mamba_slot_read_offsets=mamba_slot_read_offsets,
++                mamba_request_distribution=mamba_request_distribution,
+                 padded_num_reqs=num_reqs,
+                 pcp=pcp,
+             )
+@@ -1248,6 +1260,7 @@ class CompilationManager:
+         self._precompile_process_and_extend_logits()
+         self._precompile_extend_logits_simple()
+         self._precompile_select_from_array_spec_decode()
++        self._precompile_update_mamba_slot_read_offsets()
+         if self.runner.speculative_config.method == "eagle3":
+             self._precompile_eagle3_helpers()
+         elif self.runner.speculative_config.method == "dflash":
+@@ -1255,6 +1268,31 @@ class CompilationManager:
+         elif self.runner.speculative_config.method == "mtp":
+             self._precompile_mtp_helpers()
+ 
++    def _precompile_update_mamba_slot_read_offsets(self) -> None:
++        if self.runner.mamba_slot_read_offsets is None:
++            return
++        logger.info("Compiling _update_mamba_slot_read_offsets_fn.")
++        from tpu_inference.runner.tpu_runner import \
++            _update_mamba_slot_read_offsets_fn
++        data_parallel_attn_sharding = NamedSharding(
++            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
++        state_indices = self._create_dummy_tensor(
++            (self.runner.max_num_reqs, ),
++            jnp.int32,
++            sharding=data_parallel_attn_sharding)
++        read_offsets = self._create_dummy_tensor(
++            (self.runner.max_num_reqs, ),
++            jnp.int32,
++            sharding=data_parallel_attn_sharding)
++        self._run_compilation(
++            f"worker{self.runner.rank} _update_mamba_slot_read_offsets_fn",
++            _update_mamba_slot_read_offsets_fn,
++            self.runner.mamba_slot_read_offsets,
++            state_indices,
++            read_offsets,
++            self.runner.mesh,
++        )
++
+     def _precompile_select_from_array_spec_decode(self) -> None:
+         logger.info("Compiling select_from_array with different input shapes.")
+         vocab_size = self.runner.vocab_size
+@@ -1493,6 +1531,17 @@ class CompilationManager:
+                 sharding=dp_sharding)
+         else:
+             eagle3_mamba_state_indices = None
++        # The drafter's metadata is derived from the target metadata via
++        # `dataclasses.replace`, so the spec-decode mamba fields (unused by
++        # the pure-attention drafter) are still part of its pytree signature.
++        eagle3_mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
++        if eagle3_mamba_slot_read_offsets is not None:
++            eagle3_mamba_request_distribution = device_array(
++                self.runner.mesh,
++                np.array([0, 0, 0] * dp_size, dtype=np.int32),
++                sharding=dp_sharding)
++        else:
++            eagle3_mamba_request_distribution = None
+ 
+         num_reqs_dp = self._create_dummy_tensor((dp_size, ),
+                                                 jnp.int32,
+@@ -1510,6 +1559,9 @@ class CompilationManager:
+                     query_start_loc=query_start_loc,
+                     request_distribution=request_distribution,
+                     mamba_state_indices=eagle3_mamba_state_indices,
++                    mamba_slot_read_offsets=eagle3_mamba_slot_read_offsets,
++                    mamba_request_distribution=(
++                        eagle3_mamba_request_distribution),
+                     padded_num_reqs=num_reqs,
+                 )
+ 
+@@ -1629,6 +1681,17 @@ class CompilationManager:
+                                                sharding=dp_sharding)
+         else:
+             mamba_state_indices = None
++        # See the eagle3 precompile above: the drafter metadata inherits the
++        # spec-decode mamba fields from the target metadata via `replace`.
++        mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
++        if mamba_slot_read_offsets is not None:
++            mamba_request_distribution = device_array(self.runner.mesh,
++                                                      np.array([0, 0, 0] *
++                                                               dp_size,
++                                                               dtype=np.int32),
++                                                      sharding=dp_sharding)
++        else:
++            mamba_request_distribution = None
+ 
+         num_reqs_dp = self._create_dummy_tensor((dp_size, ),
+                                                 jnp.int32,
+@@ -1654,6 +1717,8 @@ class CompilationManager:
+                     query_start_loc=query_start_loc,
+                     request_distribution=request_distribution,
+                     mamba_state_indices=mamba_state_indices,
++                    mamba_slot_read_offsets=mamba_slot_read_offsets,
++                    mamba_request_distribution=mamba_request_distribution,
+                     padded_num_reqs=num_reqs,
+                 )
+ 
+@@ -1752,6 +1817,14 @@ class CompilationManager:
+                 sharding=dp_sharding)
+         else:
+             dflash_mamba_state_indices = None
++        dflash_mamba_slot_read_offsets = self.runner.mamba_slot_read_offsets
++        if dflash_mamba_slot_read_offsets is not None:
++            dflash_mamba_request_distribution = device_array(
++                self.runner.mesh,
++                np.array([0, 0, 0] * dp_size, dtype=np.int32),
++                sharding=dp_sharding)
++        else:
++            dflash_mamba_request_distribution = None
+ 
+         num_reqs_dp = self._create_dummy_tensor((dp_size, ),
+                                                 jnp.int32,
+@@ -1788,6 +1861,9 @@ class CompilationManager:
+                     query_start_loc=query_start_loc,
+                     request_distribution=request_distribution,
+                     mamba_state_indices=dflash_mamba_state_indices,
++                    mamba_slot_read_offsets=dflash_mamba_slot_read_offsets,
++                    mamba_request_distribution=
++                    dflash_mamba_request_distribution,
+                     padded_num_reqs=num_reqs,
+                 )
+ 
+@@ -1847,6 +1923,9 @@ class CompilationManager:
+                     query_start_loc=query_start_loc,
+                     request_distribution=request_distribution,
+                     mamba_state_indices=dflash_mamba_state_indices,
++                    mamba_slot_read_offsets=dflash_mamba_slot_read_offsets,
++                    mamba_request_distribution=(
++                        dflash_mamba_request_distribution),
+                     padded_num_reqs=num_reqs,
+                 )
+ 
+diff --git a/tpu_inference/runner/persistent_batch_manager.py b/tpu_inference/runner/persistent_batch_manager.py
+index 05e8275..295ee95 100644
+--- a/tpu_inference/runner/persistent_batch_manager.py
++++ b/tpu_inference/runner/persistent_batch_manager.py
+@@ -41,6 +41,12 @@ class PersistentBatchManager:
+         (decode_only, fixed_chunked_prefill_only, mixed) and set the request
+         distribution accordingly.
+ 
++        With speculative decoding the order is three segments:
++        [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
++        attention keeps its 1-token decode front segment, while the GDN
++        kernel's windowed mode covers the first two segments contiguously
++        (see `AttentionMetadata.mamba_request_distribution`).
++
+         Returns:
+             The number of swaps in requests.
+         """
+@@ -57,30 +63,47 @@ class PersistentBatchManager:
+                 num_decode, num_decode, num_reqs
+             ]
+             return swap_cnt
+-        # Use two-pointer approach to reorder the decode requests to front.
+-        i, j = 0, num_reqs - 1
+-        while i < j:
+-            i_req_id = self.input_batch.req_ids[i]
+-            j_req_id = self.input_batch.req_ids[j]
+-
+-            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
+-                # i is a decode request, move to the next one.
+-                i += 1
+-            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
+-                # j is a prefill request, move to the previous one.
+-                j -= 1
+-            else:
+-                # Swap i and j.
+-                self.input_batch.swap_states(i, j)
++
++        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
++
++        def segment(req_id: str) -> int:
++            # 0: 1-token decode, 1: speculative verify window,
++            # 2: prefill/mixed.
++            if scheduler_output.num_scheduled_tokens[req_id] == 1:
++                return 0
++            if req_id in spec_decode_tokens:
++                return 1
++            return 2
++
++        def partition(start: int, end: int, bound: int) -> tuple[int, int]:
++            """Two-pointer partition of [start, end]: requests with
++            segment <= bound before the rest. Returns (first index of the
++            second part, swaps)."""
++            nonlocal swap_cnt
++            i, j = start, end
++            while i < j:
++                if segment(self.input_batch.req_ids[i]) <= bound:
++                    i += 1
++                elif segment(self.input_batch.req_ids[j]) > bound:
++                    j -= 1
++                else:
++                    self.input_batch.swap_states(i, j)
++                    i += 1
++                    j -= 1
++                    swap_cnt += 1
++            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
+                 i += 1
+-                j -= 1
+-                swap_cnt += 1
++            return i
+ 
+-        num_decode = i + int(scheduler_output.num_scheduled_tokens[
+-            self.input_batch.req_ids[i]] == 1)
++        # Pass 1: 1-token decode requests to the front.
++        num_decode = partition(0, num_reqs - 1, 0)
++        # Pass 2: speculative verify windows before prefill/mixed requests.
++        num_windowed = num_decode
++        if num_decode < num_reqs:
++            num_windowed = partition(num_decode, num_reqs - 1, 1)
+ 
+         self.input_batch.request_distribution = [
+-            num_decode, num_decode, num_reqs
++            num_decode, num_windowed, num_reqs
+         ]
+ 
+         return swap_cnt
+diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
+index b2e9607..f51b7b0 100644
+--- a/tpu_inference/runner/tpu_runner.py
++++ b/tpu_inference/runner/tpu_runner.py
+@@ -592,6 +592,32 @@ def _subtract_num_rejected_tokens_fn(seq_lens: jax.Array, positions: jax.Array,
+     return seq_lens, positions
+ 
+ 
++@jax.jit(static_argnames=["mesh"])
++def _update_mamba_slot_read_offsets_fn(slot_read_offsets: jax.Array,
++                                       mamba_state_indices: jax.Array,
++                                       read_offsets: jax.Array,
++                                       mesh: jax.sharding.Mesh) -> jax.Array:
++    """Scatter this step's mamba read offsets into the slot-indexed buffer.
++
++    `mamba_state_indices` (rank-local base slot per batch position) and
++    `read_offsets` (num_accepted - 1 per batch position, 0 for non-spec
++    sequences) share the per-DP-rank layout of the current step. Padded
++    positions carry slot 0 (the null block) and offset 0, so their writes
++    are harmless.
++    """
++
++    def _scatter(offsets, indices, values):
++        return offsets.at[indices].set(values)
++
++    data_spec = PartitionSpec(ShardingAxisName.ATTN_DATA)
++    return jax.shard_map(
++        _scatter,
++        mesh=mesh,
++        in_specs=(data_spec, data_spec, data_spec),
++        out_specs=data_spec,
++    )(slot_read_offsets, mamba_state_indices, read_offsets)
++
++
+ def _jax_logprobs_materialize(
+         logprobs_tensors: LogprobsTensors,
+         logits_indices_selector: Optional[List[int]] = None,
+@@ -823,6 +849,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         self._init_inputs()
+         self._init_speculative_decoding()
+ 
++        # Slot-indexed mamba read offsets for speculative decoding with
++        # hybrid (attention + mamba) models; allocated in
++        # `initialize_kv_cache` once the mamba pool size is known. See
++        # `AttentionMetadata.mamba_slot_read_offsets`.
++        self.mamba_slot_read_offsets: Optional[jax.Array] = None
++
+         # Delegate functions to specific manager classes.
+         self.compilation_manager = CompilationManager(self)
+         if self.is_last_rank:
+@@ -861,6 +893,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         # every-step check.
+         self.continue_decode_eos_check_interval = (
+             envs.CONTINUE_DECODE_EOS_CHECK_INTERVAL)
++        if self.enable_continue_decode and self.vllm_config.speculative_config:
++            # The continue-decode loop builds its own AttentionMetadata
++            # without the mamba spec-decode fields (slot read offsets), so a
++            # hybrid model could read a stale state checkpoint after a
++            # verify step. Spec decoding never takes the decode-only fast
++            # path on verify steps anyway.
++            logger.warning("Disabling enable_continue_decode: not supported "
++                           "with speculative decoding.")
++            self.enable_continue_decode = False
+         self.static_max_decode_steps = self.vllm_config.additional_config.get(
+             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
+         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
+@@ -1291,6 +1332,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+             self.input_batch.init_mamba_pools(
+                 self.kv_cache_manager.actual_mamba_num_blocks)
+ 
++        # For hybrid models with spec decoding, keep a per-slot device buffer
++        # of mamba read offsets (num_accepted - 1 from each request's last
++        # verify step). The GDN kernel reads a request's initial state from
++        # `base_slot + offset`, which is how rejected draft tokens are
++        # rolled back (by selecting the checkpoint of the last accepted
++        # token, never by copying state).
++        if (kv_cache_config.has_mamba_layers
++                and self.speculative_config is not None):
++            mamba_num_blocks = self.kv_cache_manager.actual_mamba_num_blocks
++            if mamba_num_blocks is None:
++                mamba_num_blocks = (self.input_batch._mamba_local_slots *
++                                    self.dp_size)
++            offsets_sharding = NamedSharding(
++                self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
++            self.mamba_slot_read_offsets = jax.jit(
++                lambda: jnp.zeros((mamba_num_blocks, ), dtype=jnp.int32),
++                out_shardings=offsets_sharding)()
++
+         # This buffer grows dynamically to accommodate metadata and block tables.
+         # We re-initialize with a precise capacity now that kv_cache_config is known.
+         num_kv_groups = len(kv_cache_config.kv_cache_groups)
+@@ -2125,11 +2184,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         spec_decode_num_rejected_tokens = None
+         if self.speculative_config:
+             with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
+-                last_sampled_token_id, num_rejected_tokens = extract_last_sampled_tokens(
+-                    spec_decode_metadata, next_tokens,
+-                    self.speculative_config.num_speculative_tokens,
+-                    self.input_batch.vocab_size,
+-                    self.max_num_reqs // self.dp_size, self.mesh)
++                (last_sampled_token_id, num_rejected_tokens,
++                 mamba_read_offsets) = extract_last_sampled_tokens(
++                     spec_decode_metadata, next_tokens,
++                     self.speculative_config.num_speculative_tokens,
++                     self.input_batch.vocab_size,
++                     self.max_num_reqs // self.dp_size, self.mesh)
++                if self.mamba_slot_read_offsets is not None:
++                    if isinstance(attn_metadata, dict):
++                        _mamba_state_indices = next(
++                            iter(attn_metadata.values())).mamba_state_indices
++                    else:
++                        _mamba_state_indices = attn_metadata.mamba_state_indices
++                    assert _mamba_state_indices is not None
++                    self.mamba_slot_read_offsets = (
++                        _update_mamba_slot_read_offsets_fn(
++                            self.mamba_slot_read_offsets, _mamba_state_indices,
++                            mamba_read_offsets, self.mesh))
+                 self.speculative_decoding_manager.propose_draft_token_ids(
+                     next_tokens,
+                     logits_indices_selector,
+@@ -2834,18 +2905,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         mrope_positions = self.mrope_positions_cpu[:, :
+                                                    padded_total_num_scheduled_tokens]
+         _request_distribution = []
++        _mamba_request_distribution = []
+         for dp_rank in range(dp_size):
+             _num_reqs = num_req_per_dp_rank[dp_rank]
+-            # The batch has been reordered by _reorder_batch so decode requests come first
+-            # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
++            # The batch has been reordered by _reorder_batch into
++            # [decode][spec verify][prefill/mixed] segments. Count 1-token
++            # decode requests (the RPA decode segment) and windowed requests
++            # (decodes + speculative verify windows, the GDN windowed
++            # segment) in this DP rank.
+             num_decode_in_dp_rank = 0
++            num_windowed_in_dp_rank = 0
+             for req_id in req_ids_dp[dp_rank]:
+                 if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                     num_decode_in_dp_rank += 1
++                    num_windowed_in_dp_rank += 1
++                elif req_id in scheduler_output.scheduled_spec_decode_tokens:
++                    num_windowed_in_dp_rank += 1
+             _request_distribution.append(
+                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
++            _mamba_request_distribution.append(
++                [num_windowed_in_dp_rank, num_windowed_in_dp_rank, _num_reqs])
+         request_distribution = np.array(_request_distribution,
+                                         dtype=np.int32).ravel()
++        use_mamba_spec_decode = (self.kv_cache_config.has_mamba_layers
++                                 and self.speculative_config is not None)
++        mamba_request_distribution_cpu = np.array(
++            _mamba_request_distribution,
++            dtype=np.int32).ravel() if use_mamba_spec_decode else None
+ 
+         # Prefill context parallelism (single request, prefill only): head-tail
+         # arrange this request's current tokens into rank order
+@@ -3034,13 +3120,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 mamba_state_indices_cpu[req_offset:req_offset +
+                                         _num_reqs] = (global_slots %
+                                                       local_slots)
+-            (request_distribution, mamba_state_indices,
+-             dev_arrays_payload) = device_array(
+-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
+-                             metadata_blob),
+-                 sharding=metadata_attn_sharding)
++            if mamba_request_distribution_cpu is not None:
++                (request_distribution, mamba_state_indices,
++                 mamba_request_distribution,
++                 dev_arrays_payload) = device_array(
++                     self.mesh,
++                     (request_distribution, mamba_state_indices_cpu,
++                      mamba_request_distribution_cpu, metadata_blob),
++                     sharding=metadata_attn_sharding)
++            else:
++                mamba_request_distribution = None
++                (request_distribution, mamba_state_indices,
++                 dev_arrays_payload) = device_array(
++                     self.mesh, (request_distribution, mamba_state_indices_cpu,
++                                 metadata_blob),
++                     sharding=metadata_attn_sharding)
+         else:
+             mamba_state_indices = None
++            mamba_request_distribution = None
+             (request_distribution, dev_arrays_payload) = device_array(
+                 self.mesh, (request_distribution, metadata_blob),
+                 sharding=metadata_attn_sharding)
+@@ -3067,6 +3164,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+                 query_start_loc=query_start_loc,
+                 request_distribution=request_distribution,
+                 mamba_state_indices=mamba_state_indices,
++                mamba_slot_read_offsets=self.mamba_slot_read_offsets,
++                mamba_request_distribution=mamba_request_distribution,
+                 padded_num_reqs=attn_padded_num_reqs,
+                 pcp=pcp_metadata,
+             )
+diff --git a/tpu_inference/spec_decode/jax/utils.py b/tpu_inference/spec_decode/jax/utils.py
+index 1fe3c50..8c1ebfb 100644
+--- a/tpu_inference/spec_decode/jax/utils.py
++++ b/tpu_inference/spec_decode/jax/utils.py
+@@ -32,8 +32,8 @@ PLACEHOLDER_TOKEN_ID = -1
+ def extract_last_sampled_tokens(
+         spec_decode_metadata: SpecDecodeMetadata,
+         sampled_token_ids: jnp.ndarray, num_speculative_tokens: int,
+-        vocab_size: int, max_num_reqs_per_dp_rank: int,
+-        mesh: jax.sharding.Mesh) -> tuple[jnp.ndarray, jnp.ndarray]:
++        vocab_size: int, max_num_reqs_per_dp_rank: int, mesh: jax.sharding.Mesh
++) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+ 
+     def _body(draft_lengths, sampled_token_ids):
+         return _extract_last_sampled_tokens(draft_lengths, sampled_token_ids,
+@@ -45,7 +45,7 @@ def extract_last_sampled_tokens(
+         _body,
+         mesh=mesh,
+         in_specs=(data_spec, data_spec),
+-        out_specs=(data_spec, data_spec),
++        out_specs=(data_spec, data_spec, data_spec),
+     )(spec_decode_metadata.draft_lengths, sampled_token_ids)
+ 
+ 
+@@ -54,8 +54,9 @@ def extract_last_sampled_tokens(
+ def _extract_last_sampled_tokens(
+         draft_lengths: jnp.ndarray, sampled_token_ids: jnp.ndarray,
+         num_speculative_tokens: int, vocab_size: int,
+-        max_num_seq: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+-    """Extract the last sampled token and number rejected tokens per seq. """
++        max_num_seq: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
++    """Extract the last sampled token, rejected count and mamba read offset
++    per seq."""
+     # `sampled_token_ids` is the output of the rejection sampler.
+     num_draft_tokens = draft_lengths
+     batch_size = num_draft_tokens.shape[0]
+@@ -93,7 +94,14 @@ def _extract_last_sampled_tokens(
+     num_rejected_tokens = jnp.pad(num_rejected_per_seq,
+                                   (0, max_num_seq - batch_size),
+                                   constant_values=0)
+-    return last_sampled_tokens, num_rejected_tokens
++    # Mamba state checkpoint the request must resume from next step:
++    # `num_draft - num_rejected` == number of accepted output tokens - 1.
++    # Zero for sequences that did not run spec decoding this step (prefill,
++    # decode without drafts), which also resets the offset after prefill.
++    mamba_read_offsets = jnp.pad(num_draft_tokens - num_rejected_per_seq,
++                                 (0, max_num_seq - batch_size),
++                                 constant_values=0)
++    return last_sampled_tokens, num_rejected_tokens, mamba_read_offsets
+ 
+ 
+ @jax.jit
