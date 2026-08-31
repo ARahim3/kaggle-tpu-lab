@@ -9,12 +9,17 @@ native **262,144-token context**, and real speed:
 
 | What | Measured (TPU v5e-8, bf16, TP=8) |
 |---|---|
-| Decode, single stream | **104 tok/s** with MTP speculative decoding (78 without) |
-| Decode, 16 concurrent streams | **~900 tok/s aggregate** (~60 tok/s each) |
+| Decode, single stream | **104–128 tok/s** with MTP speculative decoding (78 without) |
+| Decode, 8 concurrent streams | **~540 tok/s aggregate** (~107 tok/s each, MTP on) |
+| Decode, 16 concurrent streams | **~900 tok/s aggregate** (with `--mtp 0` — see tuning note below) |
 | Prefill | **10,300 tok/s** — a 105k-token prompt in ~10 s |
 | Native 262k context | works — 225k-token prompt prefilled in ~28 s |
 | Time to live endpoint | ~30 min (~50 min without the compile-cache dataset) |
 | Output correctness with MTP | **verified lossless** — 12/12 greedy prompts exactly match non-speculative |
+
+Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades beyond
+that (verification competes with batch compute). Serving many users? Launch with
+`--max-model-len 131072 --max-num-seqs 16 --mtp 0` for max aggregate throughput.
 
 ## Why this works (the one-paragraph version)
 
