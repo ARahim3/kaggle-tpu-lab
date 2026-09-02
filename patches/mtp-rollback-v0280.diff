@@ -423,7 +423,7 @@ index 05e8275..295ee95 100644
  
          return swap_cnt
 diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
-index b2e9607..f51b7b0 100644
+index b2e9607..9dead2c 100644
 --- a/tpu_inference/runner/tpu_runner.py
 +++ b/tpu_inference/runner/tpu_runner.py
 @@ -592,6 +592,32 @@ def _subtract_num_rejected_tokens_fn(seq_lens: jax.Array, positions: jax.Array,
@@ -513,7 +513,27 @@ index b2e9607..f51b7b0 100644
          # This buffer grows dynamically to accommodate metadata and block tables.
          # We re-initialize with a precise capacity now that kv_cache_config is known.
          num_kv_groups = len(kv_cache_config.kv_cache_groups)
-@@ -2125,11 +2184,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -1623,6 +1682,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+         # Later, the multi-modality model will take the embedding as the input.
+         # For text-only model, this does nothing. It will input the input_ids and
+         # leave the embedding job inside the forward pass
++        # Keep the token ids: the sampler's spec-decode path (draft token
++        # extraction + drafter inputs) needs them even when the backbone is fed
++        # inputs_embeds for multimodal requests.
++        token_ids = input_ids
+         input_ids, inputs_embeds = self._get_input_ids_embeds(
+             input_ids, mm_embeds, is_mm_embed)
+ 
+@@ -1727,7 +1790,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+             attn_metadata=attn_metadata,
+             shared_attn_metadata=shared_attn_metadata,
+             sampling_metadata=sampling_metadata,
+-            input_ids=input_ids,
++            input_ids=token_ids,
+             hidden_states=hidden_states,
+             logits=logits,
+             aux_hidden_states=aux_hidden_states,
+@@ -2125,11 +2188,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          spec_decode_num_rejected_tokens = None
          if self.speculative_config:
              with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
@@ -542,7 +562,7 @@ index b2e9607..f51b7b0 100644
                  self.speculative_decoding_manager.propose_draft_token_ids(
                      next_tokens,
                      logits_indices_selector,
-@@ -2834,18 +2905,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -2834,18 +2909,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          mrope_positions = self.mrope_positions_cpu[:, :
                                                     padded_total_num_scheduled_tokens]
          _request_distribution = []
@@ -578,7 +598,7 @@ index b2e9607..f51b7b0 100644
  
          # Prefill context parallelism (single request, prefill only): head-tail
          # arrange this request's current tokens into rank order
-@@ -3034,13 +3120,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -3034,13 +3124,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  mamba_state_indices_cpu[req_offset:req_offset +
                                          _num_reqs] = (global_slots %
                                                        local_slots)
@@ -608,7 +628,7 @@ index b2e9607..f51b7b0 100644
              (request_distribution, dev_arrays_payload) = device_array(
                  self.mesh, (request_distribution, metadata_blob),
                  sharding=metadata_attn_sharding)
-@@ -3067,6 +3164,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -3067,6 +3168,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  query_start_loc=query_start_loc,
                  request_distribution=request_distribution,
                  mamba_state_indices=mamba_state_indices,

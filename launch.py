@@ -28,18 +28,21 @@ KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
-CACHE_DATASET = "rahim3/qwen38-xla-cache-v5e8"
+ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
-    "install":            "Installing vllm-tpu on the TPU VM (~10 min)...",
-    "installed":          "vllm-tpu installed.",
-    "cache-restored":     "XLA compile cache restored — startup will be ~18 min instead of ~35.",
-    "cache-missing":      "No compile cache found — cold compile, expect ~35 min.",
+    "install":            "Building the Python runtime with uv (~30 s)...",
+    "installed":          "Runtime ready.",
+    "mtp-patch-applied":  "MTP state-rollback patch applied.",
+    "mtp-patch-failed":   "MTP patch did not apply — speculative decoding disabled for safety.",
+    "cache-restored":     None,  # rendered below (depends on config coverage)
+    "cache-missing":      "No compile cache found — cold compile, add ~10 min.",
     "weights-mounted":    "Weights found mounted (no download needed).",
     "weights-download":   "Downloading weights from Hugging Face (~5 min)...",
     "weights-downloaded": "Weights downloaded.",
-    "server-launch":      "Starting vLLM — loading 55 GB of weights + XLA compile...",
+    "server-launch":      "Starting vLLM — loading 55 GB of weights, then TPU graph compile...",
+    "tunnel-url":         None,
     "compiling":          None,  # rendered with elapsed time below
     "serving":            "Server is HEALTHY.",
     "benchmark":          None,
@@ -99,10 +102,16 @@ def cmd_serve(args):
     }
     if args.no_tools:
         cfg["tool_call_parser"] = ""
+    if args.text_only:
+        cfg["text_only"] = True
+    if args.verbose:
+        cfg["verbose"] = True
+    if args.fast_start:
+        cfg["fast_start"] = True
 
     src = KERNEL_SRC.read_text()
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
-                     f"CFG = {json.dumps(cfg)}", src, count=1, flags=re.M)
+                     f"CFG = {cfg!r}", src, count=1, flags=re.M)
     if n != 1:
         sys.exit("kernel/serve_qwen38.py is missing the __LAUNCHER_CONFIG__ line")
 
@@ -119,7 +128,7 @@ def cmd_serve(args):
             "enable_gpu": "false",
             "enable_tpu": "true",
             "enable_internet": "true",
-            "dataset_sources": [args.weights_dataset, CACHE_DATASET],
+            "dataset_sources": [args.weights_dataset, ENV_DATASET],
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
@@ -134,8 +143,8 @@ def cmd_serve(args):
 
     STATE_FILE.write_text(json.dumps(
         {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
-    say("Pushed. Kaggle takes a few minutes to provision the TPU + attach the "
-        "55 GB weights dataset.")
+    say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
+        "datasets; the endpoint is usually live ~22 min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
     watch(f"{user}/{slug}", topic)
@@ -166,8 +175,16 @@ def read_events(topic, since):
 def render_event(ev):
     phase = ev.get("phase", "?")
     if phase == "compiling":
-        say(f"Compiling / loading... {ev.get('elapsed_s', 0) // 60} min elapsed "
-            "(cold ~35 min, cached ~18 min)")
+        say(f"Loading / compiling... {ev.get('elapsed_s', 0) // 60} min elapsed "
+            "(typically ~20 min with the env dataset, ~35 min without)")
+    elif phase == "cache-restored":
+        if ev.get("covers_this_config", True):
+            say("XLA compile cache restored for this exact config — fast start.")
+        else:
+            say("XLA compile cache restored, but not for this config — its graphs "
+                "compile cold (add ~10 min).")
+    elif phase == "tunnel-url":
+        say(f"Endpoint URL reserved: {ev.get('endpoint')}  (not live yet — wait for the banner)")
     elif phase == "serving":
         say(f"Server is HEALTHY after {ev.get('startup_secs', 0) // 60} min.")
     elif phase == "benchmark":
@@ -240,6 +257,40 @@ def watch(kernel, topic):
             "re-attach, `python launch.py stop` to kill it.")
 
 
+def cmd_build_env(args):
+    """Maintainer flow. When the kernel finishes:
+        kaggle kernels output <user>/<slug> -p bundle_out
+        then create/version the dataset from bundle_out/bundle (see README)."""
+    check_auth()
+    user = kaggle_username(args.user)
+    topic = "ktl-" + uuid.uuid4().hex[:20]
+    cfg = {"build_bundle": True, "ntfy_topic": topic, "weights_dataset": args.weights_dataset}
+    src = KERNEL_SRC.read_text()
+    src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
+                     f"CFG = {cfg!r}", src, count=1, flags=re.M)
+    if n != 1:
+        sys.exit("kernel/serve_qwen38.py is missing the __LAUNCHER_CONFIG__ line")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "build_env.py").write_text(src)
+        (td / "kernel-metadata.json").write_text(json.dumps({
+            "id": f"{user}/{args.slug}", "title": args.slug, "code_file": "build_env.py",
+            "language": "python", "kernel_type": "script", "is_private": "true",
+            "enable_gpu": "false", "enable_tpu": "true", "enable_internet": "true",
+            "dataset_sources": [args.weights_dataset],
+            "competition_sources": [], "kernel_sources": [], "model_sources": [],
+        }, indent=1))
+        r = kaggle("kernels", "push", "-p", str(td))
+        out = (r.stdout or "") + (r.stderr or "")
+        if "successfully pushed" not in out:
+            sys.exit(f"Push failed:\n{out.strip()}")
+    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
+                                      "api_key": ""}))
+    say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
+        "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
+    watch(f"{user}/{args.slug}", topic)
+
+
 def load_state():
     if not STATE_FILE.exists():
         sys.exit("No launch state found — run `python launch.py serve` first.")
@@ -292,7 +343,23 @@ def main():
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
+    s.add_argument("--text-only", action="store_true",
+                   help="skip the vision tower: ~8 min faster start, image inputs "
+                        "then error out")
+    s.add_argument("--verbose", action="store_true",
+                   help="show every vLLM log line in the kernel log")
+    s.add_argument("--fast-start", action="store_true",
+                   help="skip TPU graph precompile: endpoint live in ~4 min (with the env "
+                        "dataset), common request shapes are warmed right after; an "
+                        "unusual request shape stalls ~1 min the first time")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "
+                       "env dataset: venv + XLA cache + cloudflared")
+    s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
+    s.add_argument("--slug", default="qwen38-env-bundle")
+    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.set_defaults(fn=cmd_build_env)
 
     s = sub.add_parser("status", help="show current kernel status + recent events")
     s.add_argument("--follow", "-f", action="store_true", help="keep watching")

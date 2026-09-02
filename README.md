@@ -14,7 +14,7 @@ native **262,144-token context**, and real speed:
 | Decode, 16 concurrent streams | **~900 tok/s aggregate** (with `--mtp 0` — see tuning note below) |
 | Prefill | **10,300 tok/s** — a 105k-token prompt in ~10 s |
 | Native 262k context | works — 225k-token prompt prefilled in ~28 s |
-| Time to live endpoint | ~30 min (~50 min without the compile-cache dataset) |
+| Time to live endpoint | **~22 min** with the env dataset attached (~12 with `--text-only`, ~6 with `--fast-start`; ~40 without the dataset) |
 | Output correctness with MTP | **verified lossless** — 12/12 greedy prompts exactly match non-speculative |
 
 Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades beyond
@@ -28,8 +28,9 @@ Qwen3.8-27B is a hybrid: 48 of its 64 layers are **gated-DeltaNet linear attenti
 27B can serve 131k+ contexts on 8×16 GB TPU chips with room to spare. Until recently no TPU
 stack could run the DeltaNet layers — [vllm-tpu](https://github.com/vllm-project/tpu-inference)
 0.28.0 shipped native Pallas kernels for them (Aug 2026), and this repo is the recipe that
-puts it all together on Kaggle's free tier: pinned versions, pre-mirrored weights, a
-pre-built XLA compile cache, MTP speculative decoding, and a tunnel to the outside world.
+puts it all together on Kaggle's free tier: a pre-built Python runtime with pinned
+versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
+and a tunnel to the outside world.
 
 ## Quick start A — from your terminal
 
@@ -55,13 +56,14 @@ progress to your terminal so you always know what's happening:
 [14:05]  Pushing kernel you/qwen38-tpu-serve (TPU v5e-8)...
 [14:06]  Kaggle: queued — waiting for a TPU v5e-8 slot...
 [14:08]  Kaggle: provisioning the VM and attaching datasets (a few minutes)...
-[14:14]  Installing vllm-tpu on the TPU VM (~10 min)...
-[14:24]  XLA compile cache restored — startup will be ~18 min instead of ~35.
-[14:24]  Weights found mounted (no download needed).
-[14:24]  Starting vLLM — loading 55 GB of weights + XLA compile...
-[14:32]  Compiling / loading... 8 min elapsed (cold ~35 min, cached ~18 min)
-[14:42]  Server is HEALTHY after 18 min.
-[14:42]  Quick benchmark: 108.3 tok/s single-stream decode
+[14:14]  Building the Python runtime with uv (~30 s)...
+[14:15]  Runtime ready.
+[14:15]  XLA compile cache restored for this exact config — fast start.
+[14:15]  Weights found mounted (no download needed).
+[14:15]  Starting vLLM — loading 55 GB of weights, then TPU graph compile...
+[14:15]  Endpoint URL reserved: https://xxxx-yyyy.trycloudflare.com/v1  (not live yet — wait for the banner)
+[14:19]  Loading / compiling... 4 min elapsed (typically ~20 min with the env dataset, ~35 min without)
+[14:35]  Server is HEALTHY after 20 min.
 
 ==================================================================
   YOUR ENDPOINT IS LIVE
@@ -81,6 +83,8 @@ sequences):
 python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel streams (~900 tok/s aggregate)
 python launch.py serve --reasoning-effort medium                 # server-side default
 python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
+python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
+python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 ```
 
 ## Quick start B — as a Kaggle notebook
@@ -137,7 +141,7 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 
 ```
 launch.py                        the CLI: serve / status / stop, with live progress
-kernel/serve_qwen38.py           the Kaggle kernel: install → patch → cache → weights → vLLM → tunnel
+kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
 tools/embed_patch.py             re-embeds the patch into the kernel script after edits
@@ -147,9 +151,30 @@ Plus two public Kaggle datasets the kernel attaches:
 
 - **`rahim3/qwen3-8-27b-bf16`** — mirror of `Qwen/Qwen3.8-27B` (55.6 GB safetensors).
   Attaching it skips the HF download entirely.
-- **`rahim3/qwen38-xla-cache-v5e8`** — pre-populated JAX/XLA compile cache for exactly
-  this stack (vllm-tpu 0.28.0 on v5e-8). Cuts cold-start compile roughly in half. If
-  versions ever drift it's simply ignored (cache miss → normal compile).
+- **`rahim3/qwen38-tpu-env-v5e8`** — the JAX/XLA compile cache for the documented
+  configs (262k/4 and 131k/16 with images on, plus 262k/4 text-only; all MTP k=3), a
+  `cloudflared` binary, and a `manifest.json` recording the build date and versions.
+  The kernel pins its `uv` dependency resolution to that build date so the cache keeps
+  matching. If the Python or vllm-tpu version ever drifts the cache is ignored and the
+  graphs compile cold — slower, never broken.
+
+### Where the startup time goes (and went)
+
+The first version of this recipe took ~50 min from "Run" to a live URL. Measured now: ~22
+(~12 with `--text-only`, ~6 with `--fast-start`):
+
+| Step | Before | Now | How |
+|---|---|---|---|
+| pip install | 11 min | **30 s** | `uv` into a fresh venv with CPU torch (the PyPI default is the CUDA build + 3 GB of NVIDIA libs), resolution pinned to the cache's build date |
+| Weights → TPU | 3 min | 3 min | reading 55 GB; unchanged |
+| Vision-tower graphs | 13–23 min | ~8 min (0 with `--text-only`) | the compile part is now cached; the rest is tpu-inference tracing the vision encoder at warm-up, which no cache can skip |
+| Text graphs at all in `--fast-start` | — | 0 at startup | precompile skipped; the script warms the common shapes right after READY, rare shapes stall ~1 min once |
+| Text graphs | 8 buckets, ~19 min cold | 6 buckets, ~4 min | cache built for the *shipped* config (the old cache never matched, so every run compiled cold), `MIN_TOKEN_BUCKET=64`, 4 parallel compile threads |
+| Tunnel | after the self-test | in parallel with the server start | URL is printed early, banner marks readiness |
+
+Maintainers rebuild the bundle with `python launch.py build-env` (serves each config
+once on a TPU kernel, ~2 h) and create/version the dataset from the kernel's output
+folder in the Kaggle UI (Output tab → New Dataset).
 
 ## Good to know / limits
 
@@ -165,6 +190,14 @@ Plus two public Kaggle datasets the kernel attaches:
   ~5 s for a 50k-token conversation, noticeable but fine.
 - **First request after idle** can be a touch slower (scheduler warm-up); throughput
   numbers above are steady-state.
+- **Images work, with a one-time cost per image size.** Qwen3.8 is a vision-language model
+  and the endpoint accepts `image_url` content (verified: it reads text and shapes from
+  screenshots, with MTP on — that needed one more hunk in our patch, since tpu-inference
+  0.28.0 crashes the engine on image + speculative decoding). tpu-inference compiles the
+  vision encoder per image grid size, so the **first** image at a new resolution takes
+  ~1 min and may even time out at the tunnel (HTTP 524) — just retry; every later image
+  of that size is instant. Coding agents send screenshots at a consistent size, so this
+  is paid once. `--text-only` drops image support and ~8 min of startup.
 - **MTP speculative decoding: on by default, and there's a story.** Qwen3.8 ships a
   native MTP draft head, but stock vllm-tpu 0.28.0 **corrupts outputs** with it on
   TPU — rejected draft tokens advance the gated-DeltaNet recurrent state and are never
@@ -178,8 +211,12 @@ Plus two public Kaggle datasets the kernel attaches:
   acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
   than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.
-- Kaggle's preinstalled `torchaudio` is incompatible with vllm-tpu's torch — the script
-  uninstalls it automatically. Don't be alarmed by the log line.
+- **Harmless log noise.** vLLM prints a few scary-looking lines on every TPU start:
+  `Unable to poll the TPU GCE Metadata` (Kaggle isn't a GCE VM), `Failed to import
+  from vllm._C` (that's the CUDA extension), `Triton ... 0 active driver(s)`, and
+  `Transparent hugepages are not enabled`. None of them matter. The kernel log only
+  shows real progress lines; the full vLLM output is saved to `vllm.log` next to the
+  script (`"verbose": true` / `--verbose` prints it live).
 
 ## Credits
 
