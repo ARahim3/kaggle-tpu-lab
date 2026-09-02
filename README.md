@@ -9,7 +9,7 @@ native **262,144-token context**, and real speed:
 
 | What | Measured (TPU v5e-8, bf16, TP=8) |
 |---|---|
-| Decode, single stream | **104–128 tok/s** with MTP speculative decoding (78 without) |
+| Decode, single stream | **~130 tok/s** with MTP speculative decoding (78 without, measured before the token-bucket change) |
 | Decode, 8 concurrent streams | **~540 tok/s aggregate** (~107 tok/s each, MTP on) |
 | Decode, 16 concurrent streams | **~900 tok/s aggregate** (with `--mtp 0` — see tuning note below) |
 | Prefill | **10,300 tok/s** — a 105k-token prompt in ~10 s |
@@ -207,7 +207,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
   this repo bundles a port of it onto 0.28.0
   ([`patches/mtp-rollback-v0280.diff`](patches/mtp-rollback-v0280.diff)), applied to
   the installed wheel before serving. With the patch: **12/12 greedy prompts match the
-  non-speculative outputs exactly**, at +34 % decode speed (104 vs 78 tok/s; healthy
+  non-speculative outputs exactly**, at +34 % decode speed in the A/B test (104 vs 78 tok/s at the time; the shipped config now measures ~130; healthy
   acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
   than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.

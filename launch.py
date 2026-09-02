@@ -332,7 +332,7 @@ def main():
                         "--max-num-seqs 16 for max multi-stream throughput)")
     s.add_argument("--max-num-seqs", type=int, default=4)
     s.add_argument("--mtp", type=int, default=3,
-                   help="MTP speculative tokens (0 disables). +34%% decode; made "
+                   help="MTP speculative tokens (0 disables). +34%% decode in our A/B test; made "
                         "lossless by the bundled GDN state-rollback patch "
                         "(verified 12/12 greedy exact-match)")
     s.add_argument("--reasoning-effort", default="xhigh",
