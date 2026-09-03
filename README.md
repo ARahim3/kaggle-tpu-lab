@@ -32,7 +32,16 @@ puts it all together on Kaggle's free tier: a pre-built Python runtime with pinn
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
 
-## Quick start A — from your terminal
+## Quick start A — as a Kaggle notebook
+
+**Copy & Edit** the published Kaggle notebook and Run it —
+[**kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api**](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api)
+— or upload [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb) yourself.
+Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets named in
+the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
+and API key appear in its output.
+
+## Quick start B — from your terminal
 
 You need Python 3.9+ and a Kaggle account with **TPU access** (Settings → phone-verify
 your account if you haven't; free tier includes ~20 TPU hours/week).
@@ -87,14 +96,6 @@ python launch.py serve --text-only                               # skip the visi
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 ```
 
-## Quick start B — as a Kaggle notebook
-
-Prefer clicking? Copy the published Kaggle notebook —
-[**kaggle.com/code/rahim3/qwen38-tpu-serve**](https://www.kaggle.com/code/rahim3/qwen38-tpu-serve)
-— or upload [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb) yourself.
-Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets named in
-the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
-and API key appear in its output.
 
 ## Using it with coding agents
 
