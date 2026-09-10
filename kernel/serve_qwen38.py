@@ -1,5 +1,11 @@
 """
-Serve Qwen3.8-27B (bf16) on a Kaggle TPU v5e-8 with vLLM.
+Serve Qwen3.8-27B-abliterated (huihui-ai, bf16) on a Kaggle TPU v5e-8 with vLLM.
+
+Abliterated weights are a drop-in swap for Qwen/Qwen3.8-27B: identical config
+(64 layers, same vision tower, same native MTP head — verified), only weight
+values differ, so the same XLA compile cache applies. GGUF builds (UD-IQ4_XS
+etc.) cannot run here: vllm-tpu loads safetensors only, and at 8x16 GB HBM the
+bf16 model needs no quantization anyway.
 
 This script is pushed to Kaggle as a script kernel by ../launch.py, which fills
 in the CFG line below. It also runs standalone with defaults (e.g. pasted into
@@ -42,9 +48,9 @@ CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
 
 DEFAULTS = {
     "vllm_tpu_version": "0.28.0",
-    "weights_dataset": "rahim3/qwen3-8-27b-bf16",     # HF mirror of Qwen/Qwen3.8-27B
+    "weights_dataset": "qinglvsuan/qwen38-27b-uncensored",  # public mirror of the abliterated weights
     "env_dataset": "rahim3/qwen38-tpu-env-v5e8",       # XLA cache + cloudflared + manifest
-    "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
+    "hf_model_id": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",  # fallback download source (bf16 safetensors)
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
     "mtp_tokens": 3,               # MTP spec decoding (+34% in our A/B test). Stock vllm-tpu
@@ -64,7 +70,7 @@ DEFAULTS = {
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
-    "served_model_name": "qwen3.8-27b",
+    "served_model_name": "qwen3.8-27b-abliterated",
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
 }
@@ -303,18 +309,63 @@ else:
     publish("cache-missing", note="cold compile: expect ~10 extra minutes")
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "55 GB bf16 safetensors")
+banner(3, "Model weights", "55 GB bf16 safetensors (huihui-ai abliterated)")
 weights_slug = CFG["weights_dataset"].split("/")[-1]
 model_path = find_input(weights_slug)
+
+
+def complete_bf16_repo(path):
+    """A mounted mirror must match the upstream repo exactly: every shard from
+    the index present at the upstream byte size (guards against partial,
+    re-quantized or truncated mirrors). If the upstream sizes can't be fetched,
+    fall back to existence-only (the HF download path can't corrupt)."""
+    idx = Path(path, "model.safetensors.index.json")
+    if not idx.exists():
+        return False
+    try:
+        wmap = json.loads(idx.read_text())["weight_map"]
+    except Exception:
+        return False
+    if "mtp.fc.weight" not in wmap:   # MTP head required for lossless spec decoding
+        return False
+    shards = sorted(set(wmap.values()))
+    if not all(Path(path, n).exists() for n in shards):
+        return False
+    try:
+        req = urllib.request.urlopen(
+            "https://huggingface.co/api/models/" + CFG["hf_model_id"] + "?blobs=true",
+            timeout=30)
+        sizes = {s["rfilename"]: s.get("size", 0) for s in json.load(req)["siblings"]
+                 if s["rfilename"].endswith(".safetensors")}
+    except Exception as e:
+        log(f"   (couldn't fetch upstream shard sizes: {e} -> existence check only)")
+        return True
+    for n in shards:
+        local = os.path.getsize(Path(path, n))
+        remote = sizes.get(n, 0)
+        if remote and local != remote:
+            log(f"   shard {n}: {local / 1e9:.2f} GB on disk vs "
+                f"{remote / 1e9:.2f} GB upstream -> rejecting mount")
+            return False
+    return True
+
+
 if model_path and os.path.exists(os.path.join(model_path, "config.json")):
-    publish("weights-mounted", path=model_path)
-else:
+    if complete_bf16_repo(model_path):
+        publish("weights-mounted", path=model_path)
+    else:
+        log("   mounted dataset is INCOMPLETE (missing shards or not the bf16 repo) "
+            "-> falling back to the Hugging Face download")
+        model_path = None
+
+if model_path is None:
     publish("weights-download", model=CFG["hf_model_id"],
-            note="attach the weights dataset to skip this (~5 min parallel download)")
+            note="attach a complete mirror of the abliterated weights to skip this "
+                 "(~5 min parallel download)")
     t = time.time()
     from huggingface_hub import snapshot_download
     model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*"])
+        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*", "*.jinja"])
     publish("weights-downloaded", secs=int(time.time() - t))
 
 

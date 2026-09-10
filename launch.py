@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kaggle-tpu-lab launcher — serve Qwen3.8-27B on a free Kaggle TPU from your terminal.
+kaggle-tpu-lab launcher — serve Qwen3.8-27B-abliterated (huihui-ai) on a free Kaggle TPU.
 
     python launch.py serve                 # push the kernel and watch it come up
     python launch.py serve --reasoning-effort medium --mtp 3
@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
-WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
+WEIGHTS_DATASET = "qinglvsuan/qwen38-27b-uncensored"   # public mirror of the abliterated weights
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 
 # Friendly one-liners for each phase the kernel publishes.
@@ -54,9 +54,12 @@ PHASE_TEXT = {
 }
 
 
-def kaggle(*args, capture=True):
-    cmd = [sys.executable, "-m", "kaggle", *args]
-    r = subprocess.run(cmd, capture_output=capture, text=True)
+def kaggle(*args, capture=True, input=None):
+    # `python -m kaggle` is broken in some kaggle CLI releases (no __main__.py);
+    # prefer the console script, fall back to -m.
+    exe = shutil.which("kaggle")
+    cmd = ([exe] if exe else [sys.executable, "-m", "kaggle"]) + list(args)
+    r = subprocess.run(cmd, capture_output=capture, text=True, input=input)
     return r
 
 
@@ -138,8 +141,8 @@ def cmd_serve(args):
             sys.exit(f"Push failed:\n{out.strip()}")
         for line in out.splitlines():
             if "not valid dataset sources" in line:
-                say(f"WARNING: {line.strip()} — the kernel will still run, "
-                    "but may need to download weights / compile cold.")
+                say(f"WARNING: {line.strip()} — the kernel will download the weights "
+                    "from Hugging Face instead (~55 GB, a few extra minutes).")
 
     STATE_FILE.write_text(json.dumps(
         {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
@@ -201,7 +204,7 @@ def render_event(ev):
 Try it:
   curl $BASE/chat/completions -H "Authorization: Bearer $KEY" \\
     -H "Content-Type: application/json" -d '{
-      "model": "qwen3.8-27b",
+      "model": "qwen3.8-27b-abliterated",
       "messages": [{"role": "user", "content": "Hello!"}],
       "chat_template_kwargs": {"reasoning_effort": "low"}
     }'
@@ -314,8 +317,7 @@ def cmd_status(args):
 def cmd_stop(args):
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
-    p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+    p = kaggle("kernels", "delete", st["kernel"], input="yes\n")
     say((p.stdout + p.stderr).strip() or "done")
 
 
@@ -326,7 +328,7 @@ def main():
 
     s = sub.add_parser("serve", help="push the serving kernel and watch it come up")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
-    s.add_argument("--slug", default="qwen38-tpu-serve", help="kernel name")
+    s.add_argument("--slug", default="qwen38-abl-tpu-serve", help="kernel name")
     s.add_argument("--max-model-len", type=int, default=262144,
                    help="context length (default: native 262k; use 131072 with "
                         "--max-num-seqs 16 for max multi-stream throughput)")
@@ -340,7 +342,12 @@ def main():
                    help="server-side default; clients can still override per request")
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
-    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET,
+                   help="public Kaggle mirror of the abliterated weights "
+                        "(default: qinglvsuan/qwen38-27b-uncensored). The kernel verifies "
+                        "it is the complete 55.4 GB bf16 repo before use; if the check "
+                        "fails it downloads from Hugging Face instead. Pass "
+                        "'owner/slug' to use your own mirror")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",

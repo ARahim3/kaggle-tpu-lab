@@ -1,0 +1,15 @@
+{
+ "id": "mikiasendale/p100-serve",
+ "title": "p100-serve",
+ "code_file": "serve_p100.py",
+ "language": "python",
+ "kernel_type": "script",
+ "is_private": "true",
+ "enable_gpu": "true",
+ "enable_tpu": "false",
+ "enable_internet": "true",
+ "dataset_sources": [],
+ "competition_sources": [],
+ "kernel_sources": [],
+ "model_sources": []
+}
