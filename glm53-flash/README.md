@@ -156,7 +156,8 @@ minute with a plain message:
 - **"this session has no working TPU"**: Kaggle started the session without a TPU attached. It
   happens, most often on new or not-yet-verified accounts, and nothing in the notebook can fix it.
   Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell
-  must print 8.
+  must print 8. Some accounts are also asked for full identity verification (KYC via Persona)
+  before Kaggle grants TPU access — phone verification alone is not always enough.
 - **"no Internet from this session"**: turn Internet on in Session options. Kaggle only allows
   that on phone-verified accounts.
 - **"datasets not attached"**: Add Input in the right sidebar and attach the names it lists (the

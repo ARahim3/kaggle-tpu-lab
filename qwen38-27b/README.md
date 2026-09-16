@@ -32,6 +32,12 @@ puts it all together on Kaggle's free tier: a pre-built Python runtime with pinn
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
 
+**Why bf16 and not INT8?** On this TPU there is no memory pressure to buy off: the bf16
+model already serves 262k contexts at ~130 tok/s, and quantization would trade real
+capability for speed nothing here needs. An 8-bit recipe (W8A8, or vLLM's fp8) is
+possible on vllm-tpu if you want absolute throughput and may land as an option later —
+see issue #3 for the discussion.
+
 ## Quick start A — as a Kaggle notebook
 
 **Copy & Edit** the published Kaggle notebook and Run it —
@@ -44,7 +50,9 @@ and API key appear in its output.
 ## Quick start B — from your terminal
 
 You need Python 3.9+ and a Kaggle account with **TPU access** (Settings → phone-verify
-your account if you haven't; free tier includes ~20 TPU hours/week).
+your account if you haven't; free tier includes ~20 TPU hours/week). Some accounts are
+also asked for full identity verification (KYC via Persona) before Kaggle grants TPU
+access — phone verification alone is not always enough.
 
 ```bash
 # 1. Kaggle CLI + API token (one-time)

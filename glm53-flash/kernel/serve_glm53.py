@@ -144,10 +144,27 @@ def fail(step, msg):
     sys.exit(1)
 
 
+def sanitize_tpu_env():
+    """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
+    lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
+    to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.pop(name, None)
+        if val is not None:
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
+
+
 def preflight():
     """Look before the slow steps (~20 s): the datasets attached, Internet on (pip, cloudflared) and a real TPU present.
     Kaggle sometimes starts a "TPU" session with no TPU (a CPU-only container, most often on new or not-yet-verified
     accounts): jax then sees one CPU device and the build dies minutes later with a sharding error."""
+    sanitize_tpu_env()
     need = list(CFG["expert_datasets"]) + ([] if CFG["serve_dataset"] and mounts_of([CFG["serve_dataset"]]) else
                                            ([CFG["serve_dataset"]] if CFG["serve_dataset"] and not mounts_of(CFG["base_datasets"]) else list(CFG["base_datasets"])))
     missing = [n for n in need if not mounts_of([n])]
@@ -179,7 +196,9 @@ def preflight():
     fail("no-tpu", f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a TPU "
                    "session without one (most often on new or not-yet-verified accounts); nothing in this notebook can fix "
                    "that. Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell must "
-                   "print 8 before this script is worth running.")
+                   "print 8 before this script is worth running. Some accounts also need full identity verification (KYC "
+                   "via Persona) before Kaggle grants TPU access — phone verification alone is not always enough "
+                   "(check kaggle.com/settings).")
 
 
 # ----------------------------------------------------------------------------- 1. runtime
@@ -1261,6 +1280,8 @@ if globals().get("SERVE_FOREVER", True):
     while time.time() - t_serve < CFG["keepalive_min"] * 60:
         time.sleep(120)
         if SCHED.thread is not None and not SCHED.thread.is_alive():
+            log("   the engine scheduler exited before the scheduled auto-shutdown (that only fires after "
+                f"{CFG['keepalive_min']} min of serving) — its last error is in the log above")
             publish("stopped", reason="scheduler-exit")
             sys.exit(1)
         up = int((time.time() - t_serve) / 60)

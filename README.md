@@ -19,7 +19,9 @@ know it is the first to run that model on a TPU.
 ## What you need
 
 A Kaggle account with TPU access (phone-verify it under Settings) and its free quota,
-around 20 TPU hours a week. Nothing to install for the notebook route. For the terminal
+around 20 TPU hours a week. Note that some accounts are also asked for full identity
+verification (KYC via Persona) before Kaggle grants TPU access — phone verification
+alone is not always enough. Nothing to install for the notebook route. For the terminal
 route, Python 3.9+ and the Kaggle CLI.
 
 ## How a session works
