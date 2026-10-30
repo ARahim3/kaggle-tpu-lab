@@ -1050,6 +1050,21 @@ class H(BaseHTTPRequestHandler):
     def _sse(self, obj, event=None):
         self._raw((f"event: {event}\n" if event else "") + f"data: {json.dumps(obj)}\n\n")
 
+    def _stream_error(self, code, kind, message):
+        """Finish an already-started SSE response without writing a second HTTP status line."""
+        protocol = getattr(self, "_stream_format", None)
+        if protocol == "anthropic":
+            error_type = "rate_limit_error" if code == 429 else "overloaded_error" if code == 503 else kind
+            self._sse({"type": "error", "error": {"type": error_type, "message": message}}, "error")
+            self._stream_format = None
+            return
+        if protocol == "openai":
+            self._sse({"error": {"message": message, "type": kind, "code": kind}})
+            self._raw(b"data: [DONE]\n\n")
+            self._stream_format = None
+            return
+        self._json(code, {"error": {"type": kind, "message": message}})
+
     def do_GET(self):
         if self.path.startswith("/health"):
             return self._json(200, {"status": "ok", "model": MODEL, "layers": cfg.n_layers, "max_len": eng.max_len, "max_streams": MAX_STREAMS,
@@ -1084,11 +1099,15 @@ class H(BaseHTTPRequestHandler):
                 return log(f"client disconnected: {getattr(self, 'rid', '?')} after {getattr(e, 'n', '?')} tokens (stream cancelled)")
             if isinstance(e, QueueFull):
                 STATE["rejected"] = STATE.get("rejected", 0) + 1
+                if getattr(self, "_stream_format", None):
+                    return self._stream_error(429, "rate_limit_error", str(e))
                 return self._json(429, {"error": {"type": "rate_limit_error", "message": str(e)}}, [("Retry-After", "5")])
             import traceback; log("request failed:", traceback.format_exc()[-1500:])
             code, kind = (503, "overloaded_error") if isinstance(e, TimeoutError) else \
                          (400, "invalid_request_error") if isinstance(e, ValueError) else (500, "api_error")
             try:
+                if getattr(self, "_stream_format", None):
+                    return self._stream_error(code, kind, str(e))
                 return self._json(code, {"error": {"type": kind, "message": str(e)}})
             except Exception:  # noqa: BLE001
                 return
@@ -1108,6 +1127,7 @@ class H(BaseHTTPRequestHandler):
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.end_headers()
+            self._stream_format = "openai"
             nt = [0]
 
             def chunk(delta, finish=None):
@@ -1128,6 +1148,7 @@ class H(BaseHTTPRequestHandler):
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, on_event=on_event, **kw)
             chunk({}, finish(r))
             self._raw(b"data: [DONE]\n\n")
+            self._stream_format = None
         else:
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, **kw)
             msg = {"role": "assistant", "content": r["text"]}
@@ -1168,6 +1189,7 @@ class H(BaseHTTPRequestHandler):
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.end_headers()
+            self._stream_format = "anthropic"
             self._sse({"type": "message_start", "message": {"id": rid, "type": "message", "role": "assistant", "model": MODEL,
                                                              "content": [], "stop_reason": None, "stop_sequence": None,
                                                              "usage": {"input_tokens": len(ids), "output_tokens": 0}}}, "message_start")
@@ -1202,6 +1224,7 @@ class H(BaseHTTPRequestHandler):
             self._sse({"type": "message_delta", "delta": {"stop_reason": stop_of(r), "stop_sequence": r["stop_sequence"]},
                        "usage": {"output_tokens": r["out_len"]}}, "message_delta")
             self._sse({"type": "message_stop"}, "message_stop")
+            self._stream_format = None
         else:
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, **kw)
             content = []

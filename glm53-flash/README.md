@@ -143,6 +143,8 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
 
 - **Three concurrent streams** is the HBM limit at the full context; a fourth request waits for a
   free slot (up to 90 s, then a 503). More than eight waiting requests get a 429.
+- When a streaming request is rejected after SSE headers have started, the server emits a
+  provider-shaped SSE error event and closes the stream; non-streaming requests retain HTTP 429/503.
 - **Startup.** The weights take 4–10 minutes depending on how fast the dataset mount reads: the base store
   in under a minute, then the experts, packed onto the chips in eight threads; the draft model (2.3 GB)
   comes from Hugging Face in about a minute. The warm-up takes under a minute: the serve dataset holds

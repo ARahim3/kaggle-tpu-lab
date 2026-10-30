@@ -198,6 +198,32 @@ ths = [threading.Thread(target=fire, args=(i,)) for i in range(4)]
 [t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
 log("codes ->", codes, "| rejected", STATE.get("rejected"))
 assert sorted(codes) == [200, 200, 200, 429], codes
+log("=== saturated OpenAI streaming request returns an SSE error, not a second HTTP response")
+stream_payloads = [None] * 4
+def fire_openai_stream(i):
+    with post("/v1/chat/completions", {"stream": True, "max_tokens": 24,
+                                        "messages": [{"role": "user", "content": f"Stream {i}, please."}]}) as response:
+        stream_payloads[i] = response.read().decode()
+assert SCHED.pause(30)
+ths = [threading.Thread(target=fire_openai_stream, args=(i,)) for i in range(4)]
+[t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
+openai_errors = [p for p in stream_payloads if '"error"' in p]
+log("OpenAI error events", len(openai_errors))
+assert len(openai_errors) == 1 and "data: [DONE]" in openai_errors[0], stream_payloads
+assert all("HTTP/1." not in p for p in stream_payloads), stream_payloads
+log("=== saturated Anthropic streaming request returns an error event")
+stream_payloads = [None] * 4
+def fire_anthropic_stream(i):
+    with post("/v1/messages", {"stream": True, "max_tokens": 24,
+                                "messages": [{"role": "user", "content": f"Stream {i}, please."}]}) as response:
+        stream_payloads[i] = response.read().decode()
+assert SCHED.pause(30)
+ths = [threading.Thread(target=fire_anthropic_stream, args=(i,)) for i in range(4)]
+[t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
+anthropic_errors = [p for p in stream_payloads if "event: error" in p]
+log("Anthropic error events", len(anthropic_errors))
+assert len(anthropic_errors) == 1 and '"type": "rate_limit_error"' in anthropic_errors[0], stream_payloads
+assert all("HTTP/1." not in p for p in stream_payloads), stream_payloads
 h = json.loads(urllib.request.urlopen(URL + "/health").read())
 log("health", {k: v for k, v in h.items() if k in ("active", "pending", "live_contexts", "max_streams", "max_sets", "max_queue", "piece", "buckets", "requests", "steps", "step_tokens", "snap_parks", "snap_hits", "rejected")})
 log("HARNESS OK")
