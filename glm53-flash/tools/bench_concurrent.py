@@ -45,11 +45,11 @@ def main():
         print(f"  serial total: {tot} tokens in {time.time() - t0:.1f}s = {tot / (time.time() - t0):.1f} tok/s")
     for rnd in range(a.rounds):
         print(f"--- concurrent round {rnd + 1}: {a.streams} requests at once")
-        h0 = health(a.url)
+        h0 = health(a.url, a.key)
         out = {}
         ths = [threading.Thread(target=one, args=(a.url, a.key, p, a.max_tokens, out, i)) for i, p in enumerate(prompts)]
         t0 = time.time(); [t.start() for t in ths]; [t.join() for t in ths]; dt = time.time() - t0
-        h1 = health(a.url)
+        h1 = health(a.url, a.key)
         tot = 0
         for i in range(a.streams):
             r = out[i]
@@ -60,7 +60,7 @@ def main():
         steps = h1.get("steps", 0) - h0.get("steps", 0); rows = h1.get("step_tokens", 0) - h0.get("step_tokens", 0)
         print(f"  concurrent total: {tot} tokens in {dt:.1f}s = {tot / dt:.1f} tok/s aggregate | server steps {steps}, "
               f"rows {rows} (avg batch {rows / max(steps, 1):.2f})")
-    print("health:", {k: v for k, v in health(a.url).items() if k in ("active", "pending", "live_contexts", "max_streams", "max_sets", "requests", "tokens")})
+    print("health:", {k: v for k, v in health(a.url, a.key).items() if k in ("active", "pending", "live_contexts", "max_streams", "max_sets", "requests", "tokens")})
 
 
 if __name__ == "__main__":

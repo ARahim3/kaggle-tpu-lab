@@ -43,7 +43,9 @@ python launch.py serve --model glm53-flash
 ```
 
 The launcher pushes the kernel, follows its progress and prints the endpoint and key when the
-server is up. `python launch.py status` re-attaches, `python launch.py stop` ends the session.
+server is up. The bearer key is kept in a user-only local state file and is not sent through
+the ntfy progress relay. `/health` and `/v1/models` require the same API key as inference
+requests. `python launch.py status` re-attaches, `python launch.py stop` ends the session.
 
 ## Quick start C — on a Google Cloud TPU VM
 
@@ -143,6 +145,8 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
 
 - **Three concurrent streams** is the HBM limit at the full context; a fourth request waits for a
   free slot (up to 90 s, then a 503). More than eight waiting requests get a 429.
+- When a streaming request is rejected after SSE headers have started, the server emits a
+  provider-shaped SSE error event and closes the stream; non-streaming requests retain HTTP 429/503.
 - **Startup.** The weights take 4–10 minutes depending on how fast the dataset mount reads: the base store
   in under a minute, then the experts, packed onto the chips in eight threads; the draft model (2.3 GB)
   comes from Hugging Face in about a minute. The warm-up takes under a minute: the serve dataset holds
@@ -152,7 +156,9 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
   (the three speculative-decoding program sets take 6–8 minutes each), and the run leaves `exported/`
   and `jax_cache/` in `/kaggle/working`, which is how the serve dataset is made.
 - **Sessions.** Kaggle stops a TPU session after nine hours; the kernel shuts itself down after
-  `keepalive_min` minutes so a forgotten run does not burn your quota. Each run gets a new
+  `keepalive_min` minutes so a forgotten run does not burn your quota, and earlier than that
+  after `idle_min` minutes with no request running or queued (15 by default, `0` disables it).
+  Each run gets a new
   tunnel URL. A fresh Cloudflare hostname can take a minute to resolve.
 - **Stop sequences** apply to the text output, not to the reasoning.
 - **Long tool calls and the tunnel.** Cloudflare closes a response that stays silent for about
@@ -174,7 +180,8 @@ minute with a plain message:
 - **"this session has no working TPU"**: Kaggle started the session without a TPU attached. It
   happens, most often on new or not-yet-verified accounts, and nothing in the notebook can fix it.
   Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell
-  must print 8.
+  must print 8. Some accounts are also asked for full identity verification (KYC via Persona)
+  before Kaggle grants TPU access — phone verification alone is not always enough.
 - **"no Internet from this session"**: turn Internet on in Session options. Kaggle only allows
   that on verified accounts (a phone number; some accounts are also asked for an identity check through Persona
   before TPU sessions are handed out).
@@ -187,8 +194,8 @@ minute with a plain message:
   running but only reachable inside the kernel; start the session again. A fresh URL can take a
   minute to resolve, and the kernel replaces one that never does, so watch the log for a
   `NEW ENDPOINT` line before giving up.
-- **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default, 90 minutes in the notebook's config)
-  and Kaggle ends TPU sessions after nine hours.
+- **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default, 90 minutes in the notebook's config),
+  or after `idle_min` minutes with no request running or queued (15 by default), and Kaggle ends TPU sessions after nine hours.
 - **Anything else**: the log prints the step it was in and the error; paste that into an issue.
 
 ## Credits

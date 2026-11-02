@@ -11,6 +11,12 @@ it, and a write-up of how it works and what we measured.
 |---|---|---|---|---|---|---|---|---|
 | [Qwen3.8-27B](qwen38-27b/) | bf16, no quantization | 262k | ~130 tok/s | ~540 tok/s at 8 | 10,300 tok/s | ~22 min | vllm-tpu + one patch | [notebook](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api) |
 | [GLM-5.3-Flash](glm53-flash/) (320B MoE) | 3-bit experts, int8 rest | 262k | ~165 tok/s | ~170 tok/s at 3 | ~1,800 tok/s | 6–13 min | our own JAX engine | [notebook](https://www.kaggle.com/code/rahim3/glm-5-3-flash-on-a-free-kaggle-tpu-165-tok-s-api) |
+| [Qwen3.8-27B (GPU)](qwen38-27b-gpu/) | AWQ-INT4, T4 x2 | 16k | ~20 tok/s | ~61 tok/s at 4 | — | 5:29 warm / 13:26 cold | stock vLLM | batch/regression lane — see the [folder README](qwen38-27b-gpu/README.md) |
+
+The GPU lane draws Kaggle's separate 30 h/week GPU quota instead of TPU quota, but its
+interactive tail latency is measured bad (c8 p99 16.8 s) — use it for batch and
+regression work, not chat. Modal hosts the same model without a queue:
+see [`modal/`](modal/).
 
 Numbers are measured on the shipped configuration; the folder READMEs say how. Qwen runs on
 vllm-tpu with one patch. GLM-5.3-Flash runs on an engine we wrote in JAX for it; as far as we
@@ -61,6 +67,11 @@ how, `kernel/` with the serving script, `notebook/` with the run-all notebook ge
 from it, plus whatever the recipe needs (a patch, an engine). The launcher and the
 notebook share the same config block, so a setting changed in one place means the same
 thing in the other.
+
+## Research notes
+
+- [DeepSeek V4.1 Flash and Qwen3.8-Flash-Next on Kaggle](docs/research/deepseek-v4.1-flash-kaggle.md) — hardware fit,
+  runtime support, and a staged proof-of-concept recommendation; no cloud run is claimed.
 
 ## License
 

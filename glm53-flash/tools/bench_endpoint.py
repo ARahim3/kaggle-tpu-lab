@@ -19,8 +19,9 @@ def post(url, path, body, key, stream=False):
     return urllib.request.urlopen(req, timeout=1800)
 
 
-def health(url):
-    return json.loads(urllib.request.urlopen(url + "/health", timeout=30).read())
+def health(url, key):
+    req = urllib.request.Request(url + "/health", headers={"Authorization": f"Bearer {key}"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
 
 
 def anthropic_stream(url, key, body):
@@ -83,14 +84,14 @@ def image_steps(url, key):
     r1 = anthropic_stream(url, key, body); print(f"image turn 1 ({n_in} input tokens):", show(r1), "|", r1["_text"][:160])
     msgs += [{"role": "assistant", "content": [{"type": "text", "text": r1["_text"]}]},
              {"role": "user", "content": "Which shape is on the left?"}]
-    h0 = health(url)
+    h0 = health(url, a.key)
     r2 = anthropic_stream(url, key, {**body, "messages": msgs})
-    print("image turn 2:", show(r2), "| prefix reused:", health(url)["prefix_tokens_reused"] - h0["prefix_tokens_reused"], "|", r2["_text"][:120])
+    print("image turn 2:", show(r2), "| prefix reused:", health(url, a.key)["prefix_tokens_reused"] - h0["prefix_tokens_reused"], "|", r2["_text"][:120])
     t = time.time()
     r = json.loads(post(url, "/v1/chat/completions", {"max_tokens": 80, "temperature": 0, "messages": [{"role": "user", "content": [
         {"type": "text", "text": "Describe the image briefly."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}, key).read())
     print(f"openai image: {time.time() - t:.2f}s |", r["choices"][0]["message"].get("content", "")[:160], r["usage"])
-    h = health(url)
+    h = health(url, a.key)
     print("vision counters:", {k: v for k, v in h.items() if "image" in k or "vision" in k})
 
 
@@ -101,7 +102,7 @@ def main():
     ap.add_argument("--image", action="store_true", help="only the vision steps"); ap.add_argument("--no-image", action="store_true")
     a = ap.parse_args()
     url = (a.url or None).rstrip("/")
-    print("endpoint", url, "| health", {k: v for k, v in health(url).items() if k in ("max_len", "requests", "prefix_hits")})
+    print("endpoint", url, "| health", {k: v for k, v in health(url, a.key).items() if k in ("max_len", "requests", "prefix_hits")})
     if a.image:
         return image_steps(url, a.key)
     # 1. OpenAI chat
@@ -123,9 +124,9 @@ def main():
     if uses:
         msgs += [{"role": "assistant", "content": r["content"]},
                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "kaggle-tpu-vm\n"}]}]
-        h0 = health(url)
+        h0 = health(url, a.key)
         print("follow-up:", {k: v for k, v in anthropic_stream(url, a.key, {"model": "glm-5.3-flash", "max_tokens": 120, "temperature": 0, "messages": msgs, "tools": tools}).items() if not k.startswith("_")},
-              "| prefix reused:", health(url)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
+              "| prefix reused:", health(url, a.key)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
     if a.skip_long:
         return
     # 4. long document, two turns
@@ -144,12 +145,12 @@ def main():
     # turn 2 sends the thinking block back (as Claude Code does within a turn)
     msgs += [{"role": "assistant", "content": [{"type": "thinking", "thinking": r1["_thinking"], "signature": ""}, {"type": "text", "text": r1["_text"]}]},
              {"role": "user", "content": "Repeat it once more, then say done."}]
-    h0 = health(url)
-    r2 = anthropic_stream(url, a.key, {**body, "messages": msgs}); print("  turn 2 (thinking sent back):", show(r2), "| prefix reused:", health(url)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
+    h0 = health(url, a.key)
+    r2 = anthropic_stream(url, a.key, {**body, "messages": msgs}); print("  turn 2 (thinking sent back):", show(r2), "| prefix reused:", health(url, a.key)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
     # turn 3 drops the thinking (as clients do for earlier turns) -> the server keeps its reasoning and reuses the context
     msgs += [{"role": "assistant", "content": [{"type": "text", "text": r2["_text"]}]}, {"role": "user", "content": "Now say goodbye in three words."}]
-    h0 = health(url)
-    r3 = anthropic_stream(url, a.key, {**body, "messages": msgs}); print("  turn 3 (thinking dropped):", show(r3), "| prefix reused:", health(url)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
+    h0 = health(url, a.key)
+    r3 = anthropic_stream(url, a.key, {**body, "messages": msgs}); print("  turn 3 (thinking dropped):", show(r3), "| prefix reused:", health(url, a.key)["prefix_tokens_reused"] - h0["prefix_tokens_reused"])
     # 5. interleaved sessions: a background call with another system prompt evicts the long-doc context; the next turn of
     #    the long-doc conversation must resume from its parked snapshot (only the new turn is prefilled)
     rb = anthropic_stream(url, a.key, {"model": "glm-5.3-flash", "max_tokens": 30, "temperature": 0,
@@ -157,8 +158,8 @@ def main():
                                         "messages": [{"role": "user", "content": "Title for a chat about TPUs, five words."}]})
     print("  background call (other system prompt):", show(rb))
     msgs += [{"role": "assistant", "content": [{"type": "text", "text": r3["_text"]}]}, {"role": "user", "content": "One more: count to three."}]
-    h1 = health(url)
-    r4 = anthropic_stream(url, a.key, {**body, "messages": msgs}); h2 = health(url)
+    h1 = health(url, a.key)
+    r4 = anthropic_stream(url, a.key, {**body, "messages": msgs}); h2 = health(url, a.key)
     print("  turn 4 after the interleave:", show(r4), "| prefix reused:", h2["prefix_tokens_reused"] - h1["prefix_tokens_reused"],
           "| snap hits", h2.get("snap_hits", 0) - h1.get("snap_hits", 0), "| store", h2.get("snap_entries"), "entries",
           f"{h2.get('snap_bytes', 0) / 1e6:.0f} MB, snapshot time total {h2.get('snap_s', 0):.2f}s")

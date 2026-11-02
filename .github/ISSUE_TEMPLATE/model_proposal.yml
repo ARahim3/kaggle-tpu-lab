@@ -1,0 +1,70 @@
+name: Model proposal
+description: Propose a new model or serving lane for this repository
+title: "[model] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository serves one model per folder. A proposal should say why
+        the model fits free Kaggle hardware, and what the recipe needs.
+
+        Include measurements, not estimates. If you have run it, paste the
+        numbers and the commit you ran them at.
+  - type: input
+    id: model
+    attributes:
+      label: Model and revision
+      description: Name, parameter count, and the exact revision or dataset slug.
+      placeholder: SomeModel-30B-A3B @ <hf revision or kaggle dataset>
+    validations:
+      required: true
+  - type: dropdown
+    id: accelerator
+    attributes:
+      label: Target accelerator
+      options:
+        - Kaggle TPU v5e-8
+        - Kaggle TPU v2e-8
+        - Kaggle GPU (T4 x2)
+        - Google Cloud TPU VM
+        - Modal (GPU)
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: How does it fit the memory budget?
+      description: |
+        Weights size, quantization, tensor or expert parallelism, and the
+        measured peak memory. Include the arithmetic if you have not measured
+        it yet.
+    validations:
+      required: true
+  - type: textarea
+    id: engine
+    attributes:
+      label: What engine runs it?
+      description: |
+        An existing engine (vllm-tpu, stock vLLM, llama.cpp, a JAX engine you
+        wrote) plus any patches it needs, and where those patches live.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measured numbers
+      description: |
+        Time to live endpoint, decode tok/s at one and at several streams,
+        prefill tok/s, context length, and the accelerator they came from.
+    validations:
+      required: false
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed structure
+      description: |
+        The folder, kernel script, notebook, patch and README you would add,
+        and what you would need from a reviewer.
+    validations:
+      required: true

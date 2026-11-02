@@ -1,0 +1,7 @@
+project_id = "replace-with-your-project-id"
+zone       = "us-central1-a"
+
+# This repository's serving recipes require eight chips.
+accelerator_type = "v5litepod-8"
+runtime_version  = "v2-alpha-tpuv5-lite"
+spot             = true

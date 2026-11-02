@@ -34,15 +34,16 @@ STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
 
 def save_state(state):
-    """Persist the launcher state (it holds the API key) atomically, owner-readable only."""
+    """Atomically persist launcher credentials with user-only permissions."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(tmp, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(state, f)
         f.write("\n")
-    tmp.replace(STATE_FILE)
-    STATE_FILE.chmod(0o600)
+    os.replace(tmp, STATE_FILE)
+    os.chmod(STATE_FILE, 0o600)
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
@@ -54,6 +55,8 @@ MODELS = {
     "qwen38-27b": {"kernel": KERNEL_SRC, "slug": "qwen38-tpu-serve", "model_name": "qwen3.8-27b", "minutes": 22},
     "glm53-flash": {"kernel": HERE / "glm53-flash" / "kernel" / "serve_glm53.py", "slug": "glm53-tpu-serve",
                     "model_name": "glm-5.3-flash", "engine": HERE / "glm53-flash" / "engine" / "glm53", "minutes": 25},
+    "qwen38-27b-gpu": {"kernel": HERE / "qwen38-27b-gpu" / "kernel" / "serve_qwen38_gpu.py", "slug": "qwen38-gpu-serve",
+                       "model_name": "qwen38-27b-awq", "minutes": 14, "gpu": "t4x2"},
 }
 
 # Friendly one-liners for each phase the kernel publishes.
@@ -129,7 +132,26 @@ def cmd_serve(args):
     topic = "ktl-" + uuid.uuid4().hex[:20]
     api_key = ("glm-" if args.model == "glm53-flash" else "sk-") + secrets.token_hex(16)
 
-    if args.model == "qwen38-27b":
+    if args.model == "qwen38-27b-gpu":
+        cfg = {
+            "ntfy_topic": topic,
+            "api_key": api_key,
+            "max_model_len": args.gpu_max_model_len,
+            "max_num_seqs": args.gpu_max_num_seqs,
+            "gpu_mem_util": args.gpu_mem_util,
+            "enforce_eager": args.gpu_enforce_eager,
+            "keepalive_min": args.keepalive_min,
+            "idle_min": args.idle_min,
+            "hf_model_id": args.gpu_hf_model_id,
+        }
+        if args.weights_dataset:
+            cfg["weights_dataset"] = args.weights_dataset
+        if args.gpu_cache_dataset:
+            cfg["vllm_cache_dataset"] = args.gpu_cache_dataset
+        if args.verbose:
+            cfg["verbose"] = True
+        datasets = []
+    elif args.model == "qwen38-27b":
         cfg = {
             "ntfy_topic": topic,
             "api_key": api_key,
@@ -138,6 +160,7 @@ def cmd_serve(args):
             "mtp_tokens": args.mtp,
             "reasoning_effort_default": args.reasoning_effort,
             "keepalive_min": args.keepalive_min,
+            "idle_min": args.idle_min,
             "weights_dataset": args.weights_dataset,
         }
         if args.no_tools:
@@ -159,6 +182,7 @@ def cmd_serve(args):
             "streams": args.streams,
             "reasoning_effort_default": args.reasoning_effort if args.reasoning_effort in ("low", "medium", "high") else "low",
             "keepalive_min": args.keepalive_min,
+            "idle_min": args.idle_min,
             "vision": not args.text_only,
         }
         if args.serve_dataset:
@@ -188,13 +212,14 @@ def cmd_serve(args):
             "language": "python",
             "kernel_type": "script",
             "is_private": "true",
-            "enable_gpu": "false",
-            "enable_tpu": "true",
+            "enable_gpu": "true" if model.get("gpu") else "false",
+            "enable_tpu": "false" if model.get("gpu") else "true",
             "enable_internet": "true",
             "dataset_sources": datasets,
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
-        say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
+        say(f"Pushing kernel {user}/{slug} "
+            + ("(GPU T4 x2)..." if model.get("gpu") else "(TPU v5e-8)..."))
         r = kaggle("kernels", "push", "-p", str(td))
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
@@ -263,7 +288,7 @@ def render_event(ev, api_key=None):
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
         print(f"  base URL : {ev['endpoint']}")
-        sys.stdout.write(f"  API key  : {api_key or '(stored in ' + str(STATE_FILE) + ')'}\n")
+        print(f"  API key  : {api_key or '<see local launcher state>'}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
         base = ev["endpoint"] if ev["endpoint"].endswith("/v1") else ev["endpoint"] + "/v1"
@@ -429,6 +454,9 @@ def main():
                         "(qwen38-27b: xhigh | medium | low; glm53-flash: low | medium | high, default low)")
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
+    s.add_argument("--idle-min", type=int, default=15,
+                   help="auto-shutdown after this many minutes with no request running or queued "
+                        "(0 = serve the whole keepalive window regardless of traffic)")
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
@@ -445,6 +473,18 @@ def main():
                    help="skip TPU graph precompile: endpoint live in ~4 min (with the env "
                         "dataset), common request shapes are warmed right after; an "
                         "unusual request shape stalls ~1 min the first time")
+    s.add_argument("--gpu-max-model-len", type=int, default=16384,
+                   help="qwen38-27b-gpu: context (32k x 8 seqs OOM'd both T4s; 16k x 4 fits)")
+    s.add_argument("--gpu-max-num-seqs", type=int, default=4,
+                   help="qwen38-27b-gpu: parallel sequences")
+    s.add_argument("--gpu-mem-util", type=float, default=0.88,
+                   help="qwen38-27b-gpu: gpu-memory-utilization (headroom for the AWQ create_weights overshoot)")
+    s.add_argument("--gpu-enforce-eager", action="store_true",
+                   help="qwen38-27b-gpu: skip CUDA-graph capture (shorter startup, slower decode)")
+    s.add_argument("--gpu-hf-model-id", default="cyankiwi/Qwen3.8-27B-AWQ-INT4",
+                   help="qwen38-27b-gpu: Hugging Face repo for the AWQ checkpoint (~16 GB download without a weights dataset)")
+    s.add_argument("--gpu-cache-dataset", default="",
+                   help="qwen38-27b-gpu: owner/slug of a torch.compile cache dataset (engine init 665 -> 182 s in the G2 measurement)")
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "

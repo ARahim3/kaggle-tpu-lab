@@ -14,7 +14,8 @@ Steps (each one is announced in the log):
   5/6  tunnel   — open a public cloudflared URL (printed before the server is
                   live so you can prepare your client)
   6/6  ready    — READY banner + self-test, then keep serving until
-                  keepalive_min elapses
+                  keepalive_min elapses or idle_min passes with no request
+                  (harvest_cache also tars the XLA cache into the output)
 
 With both datasets attached the endpoint is live in ~22 minutes (~12 with
 text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15 min).
@@ -66,6 +67,18 @@ DEFAULTS = {
                                    # dataset's cache); the script then warms the common
                                    # request shapes itself; rare shapes stall once (~1 min)
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
+    "idle_min": 15,                # shut down after this many minutes with no
+                                   # in-flight requests (0 = serve the full
+                                   # keepalive window regardless of traffic)
+    "harvest_cache": False,        # tar the completed XLA cache into
+                                   # /kaggle/working on the exit path, so it can
+                                   # be published as a private env-dataset update
+                                   # for this exact config
+    "burst_gateway": "",           # optional burst control-plane gateway URL;
+    "burst_instance": "",          # when set with a tunnel URL, announce
+    "burst_gateway_token": "",     # {instance, url, credential_ref, model} to
+    "burst_credential_ref": "session/qwen38",  # POST /admin/endpoints so the
+    "burst_model": "qwen38-27b",   # controller can adopt this session
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "served_model_name": "qwen3.8-27b",
@@ -99,6 +112,10 @@ if CFG["fast_start"]:
     os.environ["SKIP_JAX_PRECOMPILE"] = "1"
 # The venv ships its own libtpu; don't let the image's TPU_LIBRARY_PATH override it.
 os.environ.pop("TPU_LIBRARY_PATH", None)
+# Kaggle image updates changed the permissions on /root/.cache/uv, and when uv
+# cannot use its default cache it re-downloads ~1 GB of wheels every run.
+# Keep the cache somewhere we own (reported on upstream PR #21, 2026-10-31).
+os.environ["UV_CACHE_DIR"] = "/tmp/uv-cache"
 
 _raw = open(RAW_LOG, "a", buffering=1)
 
@@ -120,19 +137,117 @@ def banner(step, title, note=""):
     log("=" * 70)
 
 
+_SENSITIVE_PROGRESS_KEYS = frozenset({"api_key", "authorization", "access_token", "token", "secret", "credential"})
+
+
+def sanitize_progress(value):
+    """Redact credential-shaped progress fields before they reach logs or ntfy."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized = str(key).casefold().replace("-", "_")
+            sensitive = (normalized in _SENSITIVE_PROGRESS_KEYS
+                         or normalized.endswith(("_api_key", "_token", "_secret", "_credential")))
+            safe[key] = "[REDACTED]" if sensitive else sanitize_progress(item)
+        return safe
+    if isinstance(value, (list, tuple)):
+        return [sanitize_progress(item) for item in value]
+    return value
+
+
 def publish(phase, **extra):
-    """Progress event: always logged; also pushed to ntfy if a topic is set."""
-    log(f"PHASE {phase}", json.dumps(extra) if extra else "")
+    """Progress event: redact credentials before logging or publishing to ntfy."""
+    safe_extra = sanitize_progress(extra)
+    log(f"PHASE {phase}", json.dumps(safe_extra) if safe_extra else "")
     if not CFG["ntfy_topic"]:
         return
     try:
         body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}",
-                "message": json.dumps({"phase": phase, **extra})}
+                "message": json.dumps({"phase": phase, **safe_extra})}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log(f"(ntfy publish failed: {e})")
+
+
+def report_to_gateway(reason):
+    """Announce {instance, url, credential_ref, model} to the burst gateway
+    (POST /admin/endpoints adoption seam). Non-fatal: a reporting failure
+    never stops serving. The gateway token is the bearer and never logged;
+    the URL goes through sanitize_progress so a redaction slip upstream
+    cannot leak it either."""
+    if not (CFG["burst_gateway"] and url and CFG["burst_instance"]):
+        return False
+    body = sanitize_progress({
+        "instance": CFG["burst_instance"],
+        "url": f"{url}/v1",
+        "credential_ref": CFG["burst_credential_ref"] or None,
+        "model": CFG["burst_model"] or None,
+    })
+    req = urllib.request.Request(
+        f"{CFG['burst_gateway'].rstrip('/')}/admin/endpoints",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {CFG['burst_gateway_token']}",
+                 "User-Agent": "burst-kernel/0.1"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        log(f"   gateway told ({reason})")
+        return True
+    except Exception as e:
+        log(f"   (gateway report failed: {e})")
+        return False
+
+
+def server_busy():
+    """True while any request is running or queued (vLLM Prometheus gauges).
+    Returns True on blindness — a metrics failure can never idle-kill a
+    session that may be serving."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/metrics", timeout=10) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception:
+        return True
+    for gauge in ("vllm:num_requests_running", "vllm:num_requests_waiting"):
+        for line in text.splitlines():
+            if line.startswith(gauge):
+                try:
+                    if float(line.rsplit(None, 1)[1]) > 0:
+                        return True
+                except (IndexError, ValueError):
+                    pass
+                break
+    return False
+
+
+def final_harvest():
+    """Tar the completed XLA cache into the session output, synchronously on
+    the exit path: /kaggle/working only becomes session output on a clean
+    interpreter exit, and a daemon thread dies at sys.exit."""
+    if not CFG["harvest_cache"]:
+        return
+    banner(7, "XLA cache harvest", f"{XLA_CACHE} -> {WORK}/xla_cache.tar")
+    t0 = time.time()
+    tmp = Path("/tmp/xla_cache.tar")
+    if tmp.exists():
+        tmp.unlink()
+    sh(["tar", "-cf", str(tmp), "-C", "/tmp", "xla_cache"], "tar")
+    shutil.move(str(tmp), str(WORK / "xla_cache.tar"))
+    size = (WORK / "xla_cache.tar").stat().st_size / 1e9
+    log(f"   harvested {size:.2f} GB in {time.time() - t0:.0f}s")
+    publish("cache-harvested", size_gb=round(size, 2))
+
+
+def shutdown(server):
+    """Terminate vLLM, let it finish writing, harvest, exit clean."""
+    server.terminate()
+    try:
+        server.wait(timeout=120)
+    except Exception:
+        pass
+    final_harvest()
+    sys.exit(0)
 
 
 def sh(cmd, tag, show=None, env=None):
@@ -239,6 +354,36 @@ def install_runtime(built=None):
     return "pip" if rc == 0 else None
 
 
+def sanitize_tpu_env():
+    """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
+    lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
+    to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.pop(name, None)
+        if val is not None:
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
+
+
+def internet_check():
+    """A session without Internet fails every DNS lookup (pip, cloudflared, ntfy) and spends ~10 minutes in pip
+    retries before erroring out. Ask PyPI first (~2 s) so the run stops here with a plain message instead."""
+    try:
+        urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
+        log("   Internet check OK")
+    except Exception as e:  # noqa: BLE001
+        msg = (f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
+               "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
+        log("   " + msg)
+        publish("failed", step="no-internet", tail=msg)
+        sys.exit(1)
+
+
 def tpu_check():
     """Kaggle sometimes starts a "TPU" session with no TPU attached (a CPU-only container; most often on new or
     not-yet-verified accounts). jax then sees one device and vLLM dies minutes later with "Insufficient devices for
@@ -270,17 +415,25 @@ def tpu_check():
     msg = (f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a "
            "TPU session without one (most often on new or not-yet-verified accounts); nothing in this notebook can "
            "fix that. Stop the session and start it again. If it repeats, run `import jax; print(jax.device_count())` "
-           "in a fresh cell first: it must print 8 before this script is worth running.")
+           "in a fresh cell first: it must print 8 before this script is worth running. Some accounts also need full "
+           "identity verification (KYC via Persona) before Kaggle grants TPU access — phone verification alone is "
+           "not always enough (check kaggle.com/settings).")
     log("   " + msg)
     publish("failed", step="no-tpu", tail=msg)
     sys.exit(1)
 
 
+_LOG_START = 0   # byte offset in RAW_LOG where the current server run's output begins (set by launch_server)
+
+
 def server_death_report(max_lines=60):
     """What killed vLLM, from vllm.log: the root-cause exception line, the first error block and a hint for the
-    causes we have seen. The console tail alone scrolls the cause away. Returns (cause, block, hint)."""
+    causes we have seen. The console tail alone scrolls the cause away. Only the current run's lines are scanned
+    (from _LOG_START): the log is opened in append mode, so a rerun after a failed one would otherwise report the
+    previous run's cause. Returns (cause, block, hint)."""
     try:
-        lines = [l for l in RAW_LOG.read_text(errors="replace").splitlines() if l.startswith("[vllm]")]
+        data = RAW_LOG.read_bytes()[_LOG_START:]
+        lines = [l for l in data.decode("utf-8", errors="replace").splitlines() if l.startswith("[vllm]")]
     except Exception:  # noqa: BLE001
         return "", "", ""
     strip = re.compile(r"^\[vllm\] (?:\((?:EngineCore|APIServer|Worker)[^)]*\) )?(?:ERROR|CRITICAL) [\d-]+ [\d:]+ \[[^\]]+\] ?")
@@ -295,7 +448,11 @@ def server_death_report(max_lines=60):
             break
     joined = "\n".join(block)
     hint = ""
-    if re.search(r"found 1, expected 8|jellyfish|unexpected worker hostname|TPU initialization failed", joined):
+    if "unexpected worker hostname" in joined:
+        hint = ("the session exported a broken TPU_WORKER_HOSTNAMES value (Kaggle's metadata lookup failed and the "
+                "WARNING text landed in the variable); this kernel now clears that variable before starting vLLM — "
+                "run again and it should not come back")
+    elif re.search(r"found 1, expected 8|jellyfish|TPU initialization failed", joined):
         hint = ("this session has no working TPU (Kaggle sometimes starts one without, most often on new or "
                 "not-yet-verified accounts): stop the session and start it again")
     elif "__delitem__" in joined:
@@ -309,7 +466,23 @@ def server_death_report(max_lines=60):
 def server_died(server, phase, **extra):
     """Log why the vLLM server exited (root cause first), publish it, and stop the kernel."""
     cause, block, hint = server_death_report()
+    if not hint and cause:
+        # phase-gated: "failed" is the startup wait, "stopped" is the serve loop — a late failure hours into
+        # serving should not be described as a startup crash
+        hint = ("no known cause matched: attach /kaggle/working/vllm.log to an issue if it repeats"
+                + (" — a crash during startup on a real TPU is most often a flaky start or this pinned runtime "
+                   "vs a newer Kaggle base image, so running the session again once is worth a try"
+                   if phase == "failed" else ""))
     tail = "\n".join(list(server.tail)[-40:]) if getattr(server, "tail", None) else ""
+    if server.returncode == 0 and not cause:
+        # a clean exit well before the keepalive window is not the scheduled shutdown: the session itself was
+        # almost certainly stopped from outside (a "Save & Run All" commit ends when the run finishes, and an
+        # interactive session ends when Kaggle stops it) — say so instead of a bare rc=0
+        hint = (hint or "the server exited cleanly before the scheduled auto-shutdown "
+                        f"(that only fires after {CFG['keepalive_min']} min of serving): the notebook session itself "
+                        "was most likely stopped from outside. A 'Save & Run All (Commit)' run ends the moment the "
+                        "notebook finishes — the serving cell must run in an interactive session that stays open. "
+                        "Run the notebook again and leave the last cell running.")
     log(f"server exited rc={server.returncode}" + (f" — root cause: {cause}" if cause else ""))
     if hint:
         log(f"   -> {hint}")
@@ -326,7 +499,9 @@ def server_died(server, phase, **extra):
 
 # ---------------- 1. runtime ----------------
 banner(1, "Python runtime", f"vllm-tpu {CFG['vllm_tpu_version']}")
+sanitize_tpu_env()
 tpu_check()
+internet_check()
 threading.Thread(target=fetch_cloudflared, daemon=True).start()
 bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
 bundle, manifest = None, {}
@@ -426,6 +601,9 @@ def server_args(cfg):
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
             "--reasoning-parser", "qwen3"]
+    # Kaggle mounts dataset weights through FUSE.GCSFUSE, which vLLM does not
+    # auto-detect for prefetch; prefetch avoids slow demand reads during loading.
+    args += ["--safetensors-load-strategy", "prefetch"]
     if cfg.get("async_scheduling") is not None:
         args.append("--async-scheduling" if cfg["async_scheduling"] else "--no-async-scheduling")
     if cfg["text_only"]:
@@ -526,10 +704,12 @@ def make_translator():
 
 
 def launch_server(cfg):
+    global _LOG_START
     publish("server-launch", max_model_len=cfg["max_model_len"],
             max_num_seqs=cfg["max_num_seqs"], mtp=cfg["mtp_tokens"],
             text_only=cfg["text_only"], min_token_bucket=cfg["min_token_bucket"])
     tail = collections.deque(maxlen=200)
+    _LOG_START = RAW_LOG.stat().st_size   # server_death_report scans only from here (the log is append-mode)
     p = subprocess.Popen(server_args(cfg), stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
     tr = make_translator()
@@ -854,6 +1034,7 @@ log("#" * 70)
 publish("ready", endpoint=(f"{url}/v1" if url else None),        # no api_key: ntfy topics are public
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=startup)
+report_to_gateway("ready")
 
 if CFG["fast_start"]:
     banner(6, "Warm-up", "loading the common request shapes; the endpoint is usable meanwhile")
@@ -864,14 +1045,35 @@ else:
 self_test(CFG)
 
 t_serve = time.time()
+idle_deadline = CFG["idle_min"] * 60
+last_busy = time.time()          # self-test / warm-up count as traffic
+total_polls, busy_polls = 0, 0
 while time.time() - t_serve < CFG["keepalive_min"] * 60:
     time.sleep(120)
     if server.poll() is not None:
         server_died(server, "stopped", reason="server-exit")
+    total_polls += 1
+    busy = server_busy()
+    if busy:
+        busy_polls += 1
+        last_busy = time.time()
     up = int((time.time() - t_serve) / 60)
+    idle_now = int((time.time() - last_busy) / 60)
     if up % 10 < 2:
-        publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None))
-        log(f"   still serving ({up} min) — {url + '/v1' if url else ''}")
-publish("auto-shutdown", served_min=CFG["keepalive_min"])
-server.terminate()
-sys.exit(0)
+        busy_frac = round(busy_polls / max(total_polls, 1), 2)
+        publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None),
+                busy=busy, idle_min=idle_now, busy_frac=busy_frac)
+        log(f"   still serving ({up} min, idle {idle_now}, "
+            f"busy {busy_frac * 100:.0f}% of polls) — {url + '/v1' if url else ''}")
+        report_to_gateway("heartbeat")
+    if idle_deadline and (time.time() - last_busy) >= idle_deadline:
+        served_min = int((time.time() - t_serve) / 60)
+        publish("idle-shutdown", idle_min=idle_now, served_min=served_min,
+                busy_frac=round(busy_polls / max(total_polls, 1), 2))
+        log(f"#  idle for {idle_now} min (idle_min={CFG['idle_min']}) — exiting "
+            f"to free the slot after {served_min} min of serving")
+        shutdown(server)
+served_min = int((time.time() - t_serve) / 60)
+publish("auto-shutdown", served_min=served_min,
+        busy_frac=round(busy_polls / max(total_polls, 1), 2))
+shutdown(server)
