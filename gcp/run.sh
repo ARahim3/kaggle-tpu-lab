@@ -3,13 +3,15 @@
 # reach it through an SSH port forward), the compile cache in /kaggle/working. Runs in the tmux session "glm".
 #   API_KEY=... STREAMS=3 PORT=8000 ./run.sh      (all optional; a key is generated when none is given)
 set -euo pipefail
+umask 077
 export PATH="$HOME/.local/bin:$PATH"; source /mnt/data/envs/glm/bin/activate
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 RUN=/mnt/data/kaggle/working; mkdir -p "$RUN" /mnt/data/logs; cd "$RUN"
 API_KEY=${API_KEY:-glm-$(openssl rand -hex 12)}; PORT=${PORT:-8000}
 cat > serve_config.json <<JSON
-{"tunnel": false, "skip_runtime": true, "api_key": "$API_KEY", "keepalive_min": ${KEEPALIVE_MIN:-100000}, "streams": ${STREAMS:-3}, "port": $PORT}
+{"tunnel": false, "skip_runtime": true, "api_key": "$API_KEY", "bind": "127.0.0.1", "keepalive_min": ${KEEPALIVE_MIN:-100000}, "streams": ${STREAMS:-3}, "port": $PORT}
 JSON
+chmod 600 serve_config.json
 LOG=/mnt/data/logs/serve_$(date -u +%Y%m%d_%H%M).log
 tmux kill-session -t glm 2>/dev/null || true
 tmux new-session -d -s glm "PYTHONPATH=$REPO/glm53-flash/engine python $REPO/glm53-flash/kernel/serve_glm53.py 2>&1 | tee $LOG"

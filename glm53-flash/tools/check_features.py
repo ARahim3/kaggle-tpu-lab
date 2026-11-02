@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--queue", action="store_true", help="also fire max_streams + max_queue + 1 concurrent requests (expect one 429)")
     a = ap.parse_args()
     url, key = a.url.rstrip("/"), a.key
-    h = health(url)
+    h = health(url, key)
     print("health:", {k: h.get(k) for k in ("max_streams", "max_sets", "max_queue", "piece", "buckets", "hbm_free_gb")})
     ok = True
 
@@ -47,6 +47,16 @@ def main():
         nonlocal ok
         ok &= bool(cond)
         print(f"  [{'ok' if cond else 'FAIL'}] {name}" + (f": {detail}" if detail else ""))
+
+    # Health and model discovery expose runtime details, so both require the API key.
+    for path in ("/health", "/v1/models"):
+        try:
+            urllib.request.urlopen(url + path, timeout=10)
+            denied = False
+        except urllib.error.HTTPError as exc:
+            denied = exc.code == 401
+        check(f"unauthenticated GET {path} is denied", denied)
+    check("authenticated health request", health(url, key).get("status") == "ok")
 
     # 1. stop_sequences, non-streaming: a numbered list must stop before "3."
     body = {"model": "glm-5.3-flash", "max_tokens": 200, "temperature": 0,
@@ -104,11 +114,11 @@ def main():
     # 8. a follow-up after the forced call must reuse the context (the forced prefix is the template's own rendering)
     if uses := [b for b in json.loads(post(url, "/v1/messages", {"model": "glm-5.3-flash", "max_tokens": 200, "temperature": 0, "messages": msgs2,
                                                                   "tools": TOOLS_A, "tool_choice": {"type": "tool", "name": "read_file"}}, key).read())["content"] if b["type"] == "tool_use"]:
-        h0 = health(url)
+        h0 = health(url, key)
         follow = msgs2 + [{"role": "assistant", "content": [uses[0]]},
                           {"role": "user", "content": [{"type": "tool_result", "tool_use_id": uses[0]["id"], "content": "kaggle-tpu-vm\n"}]}]
         r = json.loads(post(url, "/v1/messages", {"model": "glm-5.3-flash", "max_tokens": 100, "temperature": 0, "messages": follow, "tools": TOOLS_A}, key).read())
-        h1 = health(url)
+        h1 = health(url, key)
         reused = h1["prefix_tokens_reused"] - h0["prefix_tokens_reused"]
         print(f"8. follow-up after a forced call: reused {reused} tokens, text={json.dumps(r['content'])[:160]}")
         check("forced-call context reused", reused > 0, f"{reused} tokens")

@@ -22,7 +22,7 @@ A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every prog
 FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
 can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
-import base64, collections, glob, hashlib, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
+import base64, collections, glob, hashlib, hmac, io, ipaddress, json, os, queue, re, secrets, shutil, socket, subprocess, sys, tarfile, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -76,6 +76,13 @@ DEFAULTS = {
     "base_min": 512,                 # a system section at least this long is pinned for new sessions
     "snap_warm_tokens": 32768,       # warm the snapshot programs for contexts up to this many tokens
     "keepalive_min": 480,            # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
+    "idle_min": 15,                  # shut down after this many minutes with no active or queued
+                                     # request (0 = serve the full keepalive window regardless)
+    "burst_gateway": "",             # optional burst control-plane gateway URL;
+    "burst_instance": "",            # when set with a tunnel URL, announce {instance, url,
+    "burst_gateway_token": "",       # credential_ref, model} to POST /admin/endpoints so the
+    "burst_credential_ref": "session/glm53",  # controller can adopt this session
+    "burst_model": "glm5.3-flash",
     "api_key": "",                   # generated if empty
     "ntfy_topic": "",                # optional: publish progress to ntfy.sh/<topic> (launch.py watches it)
     "dflash": "hf:incoai/GLM-5.3-Flash-DFlash2@bf582e4eacc1810f76656d1811693ff6c6737d2a",
@@ -100,6 +107,7 @@ DEFAULTS = {
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
     "port": 8000,
+    "bind": "0.0.0.0",
 }
 CFG = {**DEFAULTS, **(CFG or {}), **globals().get("CFG_PRESET", {})}
 _cfg_file = Path("serve_config.json")            # notebook flow: overrides next to this script
@@ -180,10 +188,27 @@ def fail(step, msg):
     sys.exit(1)
 
 
+def sanitize_tpu_env():
+    """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
+    lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
+    to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.pop(name, None)
+        if val is not None:
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
+
+
 def preflight():
     """Look before the slow steps (~20 s): the datasets attached, Internet on (pip, cloudflared) and a real TPU present.
     Kaggle sometimes starts a "TPU" session with no TPU (a CPU-only container, most often on new or not-yet-verified
     accounts): jax then sees one CPU device and the build dies minutes later with a sharding error."""
+    sanitize_tpu_env()
     need = list(CFG["expert_datasets"]) + ([] if mounts_of(SERVE_NAMES) else
                                            ([CFG["serve_dataset"]] if CFG["serve_dataset"] and not mounts_of(CFG["base_datasets"]) else list(CFG["base_datasets"])))
     missing = [n for n in need if not mounts_of([n])]
@@ -215,7 +240,9 @@ def preflight():
     fail("no-tpu", f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a TPU "
                    "session without one (most often on new or not-yet-verified accounts); nothing in this notebook can fix "
                    "that. Stop the session and start it again; `import jax; print(jax.device_count())` in a fresh cell must "
-                   "print 8 before this script is worth running.")
+                   "print 8 before this script is worth running. Some accounts also need full identity verification (KYC "
+                   "via Persona) before Kaggle grants TPU access — phone verification alone is not always enough "
+                   "(check kaggle.com/settings).")
 
 
 # ----------------------------------------------------------------------------- 1. runtime
@@ -506,6 +533,14 @@ def _image_bytes(block):
     if url.startswith("data:"):
         return base64.b64decode(url.split(",", 1)[1])
     if url.startswith("http://") or url.startswith("https://"):
+        host = urllib.parse.urlsplit(url).hostname or ""
+        # SSRF guard: the kernel runs on a host with access to internal metadata
+        # and cluster services; only fetch public addresses.
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+        if not host or any(ipaddress.ip_address(a).is_private or ipaddress.ip_address(a).is_loopback
+                           or ipaddress.ip_address(a).is_link_local or ipaddress.ip_address(a).is_reserved
+                           for a in addrs):
+            raise ValueError("refusing to fetch image from a non-public address")
         return urllib.request.urlopen(url, timeout=30).read()
     raise ValueError("unsupported image source")
 
@@ -1045,12 +1080,30 @@ class H(BaseHTTPRequestHandler):
         if not API_KEY:
             return True
         h = self.headers.get("Authorization", ""); k = self.headers.get("x-api-key", "")
-        return h == f"Bearer {API_KEY}" or k == API_KEY
+        expected = API_KEY.encode()
+        return hmac.compare_digest(h.encode(), f"Bearer {API_KEY}".encode()) or hmac.compare_digest(k.encode(), expected)
 
     def _sse(self, obj, event=None):
         self._raw((f"event: {event}\n" if event else "") + f"data: {json.dumps(obj)}\n\n")
 
+    def _stream_error(self, code, kind, message):
+        """Finish an already-started SSE response without writing a second HTTP status line."""
+        protocol = getattr(self, "_stream_format", None)
+        if protocol == "anthropic":
+            error_type = "rate_limit_error" if code == 429 else "overloaded_error" if code == 503 else kind
+            self._sse({"type": "error", "error": {"type": error_type, "message": message}}, "error")
+            self._stream_format = None
+            return
+        if protocol == "openai":
+            self._sse({"error": {"message": message, "type": kind, "code": kind}})
+            self._raw(b"data: [DONE]\n\n")
+            self._stream_format = None
+            return
+        self._json(code, {"error": {"type": kind, "message": message}})
+
     def do_GET(self):
+        if not self._auth():
+            return self._json(401, {"error": {"type": "authentication_error", "message": "bad api key"}})
         if self.path.startswith("/health"):
             return self._json(200, {"status": "ok", "model": MODEL, "layers": cfg.n_layers, "max_len": eng.max_len, "max_streams": MAX_STREAMS,
                                     "max_sets": MAX_SETS, "max_queue": MAX_QUEUE, "piece": SCHED.piece, "buckets": list(eng.PREFILL_BUCKETS),
@@ -1084,11 +1137,15 @@ class H(BaseHTTPRequestHandler):
                 return log(f"client disconnected: {getattr(self, 'rid', '?')} after {getattr(e, 'n', '?')} tokens (stream cancelled)")
             if isinstance(e, QueueFull):
                 STATE["rejected"] = STATE.get("rejected", 0) + 1
+                if getattr(self, "_stream_format", None):
+                    return self._stream_error(429, "rate_limit_error", str(e))
                 return self._json(429, {"error": {"type": "rate_limit_error", "message": str(e)}}, [("Retry-After", "5")])
             import traceback; log("request failed:", traceback.format_exc()[-1500:])
             code, kind = (503, "overloaded_error") if isinstance(e, TimeoutError) else \
                          (400, "invalid_request_error") if isinstance(e, ValueError) else (500, "api_error")
             try:
+                if getattr(self, "_stream_format", None):
+                    return self._stream_error(code, kind, str(e))
                 return self._json(code, {"error": {"type": kind, "message": str(e)}})
             except Exception:  # noqa: BLE001
                 return
@@ -1108,6 +1165,7 @@ class H(BaseHTTPRequestHandler):
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.end_headers()
+            self._stream_format = "openai"
             nt = [0]
 
             def chunk(delta, finish=None):
@@ -1128,6 +1186,7 @@ class H(BaseHTTPRequestHandler):
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, on_event=on_event, **kw)
             chunk({}, finish(r))
             self._raw(b"data: [DONE]\n\n")
+            self._stream_format = None
         else:
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, **kw)
             msg = {"role": "assistant", "content": r["text"]}
@@ -1168,6 +1227,7 @@ class H(BaseHTTPRequestHandler):
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.end_headers()
+            self._stream_format = "anthropic"
             self._sse({"type": "message_start", "message": {"id": rid, "type": "message", "role": "assistant", "model": MODEL,
                                                              "content": [], "stop_reason": None, "stop_sequence": None,
                                                              "usage": {"input_tokens": len(ids), "output_tokens": 0}}}, "message_start")
@@ -1202,6 +1262,7 @@ class H(BaseHTTPRequestHandler):
             self._sse({"type": "message_delta", "delta": {"stop_reason": stop_of(r), "stop_sequence": r["stop_sequence"]},
                        "usage": {"output_tokens": r["out_len"]}}, "message_delta")
             self._sse({"type": "message_stop"}, "message_stop")
+            self._stream_format = None
         else:
             r = run_request(ids, max_new, temperature, top_p, imgs, rid, **kw)
             content = []
@@ -1298,7 +1359,7 @@ if CFG["aot"]:
 publish("warmed", minutes=round((time.time() - t_warm) / 60, 1), hbm_gb=round(use, 2))
 
 SCHED.start()
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = ThreadingHTTPServer((CFG["bind"], PORT), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 log(f"   HTTP server on :{PORT}")
 
@@ -1333,13 +1394,14 @@ def start_tunnel(attempts=3, wait_s=90):
     return None
 
 
-def tunnel_probe(u, wait_s=180):
+def tunnel_probe(u, api_key, wait_s=180):
     """Background: confirm the public URL answers (a fresh hostname can take a minute to resolve); if it never does,
     open a new tunnel once and announce the new URL."""
     t0 = time.time()
     while time.time() - t0 < wait_s:
         try:
-            urllib.request.urlopen(f"{u}/health", timeout=10).read()
+            req = urllib.request.Request(f"{u}/health", headers={"Authorization": f"Bearer {api_key}"})
+            urllib.request.urlopen(req, timeout=10).read()
             log(f"   tunnel reachable from outside: {u} ({time.time() - t0:.0f} s after it opened)")
             return
         except Exception:  # noqa: BLE001
@@ -1360,7 +1422,7 @@ if CFG["tunnel"]:
     url = start_tunnel()
     if url:
         publish("tunnel-url", endpoint=url)
-        threading.Thread(target=tunnel_probe, args=(url,), daemon=True).start()
+        threading.Thread(target=tunnel_probe, args=(url, API_KEY), daemon=True).start()
     else:
         publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
 STATE["url"] = url or f"http://127.0.0.1:{PORT}"
@@ -1407,19 +1469,69 @@ log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CF
 log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=endpoint, api_key=API_KEY, model=MODEL, max_model_len=CFG["max_len"],
+
+
+def report_to_gateway(reason):
+    """Burst adoption seam: tell the control-plane gateway this session is live.
+    Non-fatal; the token is the bearer and never logged."""
+    if not (CFG["burst_gateway"] and endpoint and CFG["burst_instance"]):
+        return False
+    body = {
+        "instance": CFG["burst_instance"],
+        "url": endpoint,
+        "credential_ref": CFG["burst_credential_ref"] or None,
+        "model": CFG["burst_model"] or None,
+    }
+    req = urllib.request.Request(
+        f"{CFG['burst_gateway'].rstrip('/')}/admin/endpoints",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {CFG['burst_gateway_token']}",
+                 "User-Agent": "burst-kernel/0.1"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        log(f"   gateway told ({reason})")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"   (gateway report failed: {e})")
+        return False
+
+
+# Keep the bearer key in the local launcher state; ntfy is only a progress relay.
+publish("ready", endpoint=endpoint, model=MODEL, max_model_len=CFG["max_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=int(time.time() - T0))
+report_to_gateway("ready")
 
 if globals().get("SERVE_FOREVER", True):
     t_serve = time.time()
+    idle_deadline = CFG["idle_min"] * 60
+    last_reqs = STATE["requests"]
+    last_busy = time.time()
     while time.time() - t_serve < CFG["keepalive_min"] * 60:
         time.sleep(120)
         if SCHED.thread is not None and not SCHED.thread.is_alive():
+            log("   the engine scheduler exited before the scheduled auto-shutdown (that only fires after "
+                f"{CFG['keepalive_min']} min of serving) — its last error is in the log above")
             publish("stopped", reason="scheduler-exit")
             sys.exit(1)
         up = int((time.time() - t_serve) / 60)
+        # active/pending misses a request that arrives and finishes between two polls; a
+        # change in the completed-request counter marks the session busy anyway.
+        busy = bool(SCHED.active or SCHED.pending) or STATE["requests"] != last_reqs
+        last_reqs = STATE["requests"]
+        if busy:
+            last_busy = time.time()
+        idle_now = int((time.time() - last_busy) / 60)
         if up % 10 < 2:
-            publish("heartbeat", up_min=up, endpoint=endpoint, requests=STATE["requests"], tokens=STATE["tokens"])
-    publish("auto-shutdown", served_min=CFG["keepalive_min"])
+            publish("heartbeat", up_min=up, endpoint=endpoint, requests=STATE["requests"], tokens=STATE["tokens"],
+                    busy=busy, idle_min=idle_now)
+            report_to_gateway("heartbeat")
+        if idle_deadline and (time.time() - last_busy) >= idle_deadline:
+            served_min = int((time.time() - t_serve) / 60)
+            publish("idle-shutdown", idle_min=idle_now, served_min=served_min)
+            log(f"#  idle for {idle_now} min (idle_min={CFG['idle_min']}) — exiting "
+                f"to free the slot after {served_min} min of serving")
+            break
+    publish("auto-shutdown", served_min=int((time.time() - t_serve) / 60))
     SCHED.stop(); srv.shutdown()
     sys.exit(0)

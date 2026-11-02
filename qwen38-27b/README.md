@@ -32,6 +32,12 @@ puts it all together on Kaggle's free tier: a pre-built Python runtime with pinn
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
 
+**Why bf16 and not INT8?** On this TPU there is no memory pressure to buy off: the bf16
+model already serves 262k contexts at ~130 tok/s, and quantization would trade real
+capability for speed nothing here needs. An 8-bit recipe (W8A8, or vLLM's fp8) is
+possible on vllm-tpu if you want absolute throughput and may land as an option later —
+see issue #3 for the discussion.
+
 ## Quick start A — as a Kaggle notebook
 
 **Copy & Edit** the published Kaggle notebook and Run it —
@@ -44,7 +50,9 @@ and API key appear in its output.
 ## Quick start B — from your terminal
 
 You need Python 3.9+ and a Kaggle account with **TPU access** (Settings → phone-verify
-your account if you haven't; free tier includes ~20 TPU hours/week).
+your account if you haven't; free tier includes ~20 TPU hours/week). Some accounts are
+also asked for full identity verification (KYC via Persona) before Kaggle grants TPU
+access — phone verification alone is not always enough.
 
 ```bash
 # 1. Kaggle CLI + API token (one-time)
@@ -92,6 +100,7 @@ sequences):
 python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel streams (~900 tok/s aggregate)
 python launch.py serve --reasoning-effort medium                 # server-side default
 python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
+python launch.py serve --idle-min 0                              # never auto-stop on idle (only on keepalive)
 python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 python launch.py serve --no-async-scheduling                     # for clients that use JSON mode / structured outputs with MTP on (see "If it fails")
@@ -182,7 +191,8 @@ folder in the Kaggle UI (Output tab → New Dataset).
 
 - **One TPU session at a time** per Kaggle account, sessions cap at 9 h, free quota is
   ~20 TPU-hours/week. The server auto-stops after `--keepalive-min` so a forgotten
-  session doesn't eat your quota.
+  session doesn't eat your quota, and earlier after `--idle-min` minutes with no request
+  running or queued (15 by default, `0` disables it).
 - **The endpoint is public** (random cloudflared URL) but protected by the generated
   API key. Treat the URL+key pair like a secret; a new launch gets fresh ones.
 - **Prefix caching is off for now**: vllm-tpu 0.28.0 deliberately disables automatic

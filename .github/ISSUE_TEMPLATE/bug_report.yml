@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in a recipe, kernel, notebook or launcher does not work
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this. Please read the security policy first: if the
+        problem is a vulnerability, do not use this form.
+
+        For a request to serve a different model, use the model-proposal form
+        instead.
+  - type: dropdown
+    id: model
+    attributes:
+      label: Which model or lane is affected?
+      options:
+        - Qwen3.8-27B on TPU
+        - GLM-5.3-Flash on TPU
+        - Qwen3.8-27B on GPU (T4 x2)
+        - Modal appliance
+        - Google Cloud TPU VM (gcp/)
+        - Launcher (launch.py)
+        - Not model-specific / tooling
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or kernel version
+      description: The commit SHA of your checkout, or the Kaggle kernel version.
+      placeholder: 1a8dceb
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What did you do, and what happened instead?
+      description: |
+        The exact command, the accelerator you used (TPU v5e-8, T4 x2, GPU, Modal),
+        and the full error or log output.
+      placeholder: |
+        python launch.py serve --model qwen38-27b
+        ...
+        Traceback (most recent call last):
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: kaggle
+    attributes:
+      label: Kaggle notebook URL
+      description: If the failure is in a Kaggle session, link the run.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the existing issues for this.
+          required: true
+        - label: I read the Security policy and this is not a vulnerability.
+          required: true
