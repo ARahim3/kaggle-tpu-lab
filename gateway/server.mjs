@@ -401,9 +401,11 @@ async function stopBackend(reason) {
 }
 
 // --------------------------------------------------------------- watchdog ---
+let inFlight = 0;
 setInterval(async () => {
   const b = state.backend;
   if (!b || b.status !== "live") return;
+  if (inFlight > 0) return; // never delete the kernel mid-generation
   const now = Date.now();
   if (b.lastUsedAt && now - Date.parse(b.lastUsedAt) > cfg.idleMinutes * 60000) {
     await stopBackend("idle");
@@ -664,7 +666,13 @@ const server = http.createServer(async (req, res) => {
           clearInterval(timer);
         }
       }
-      return forward(req, res, { suffix: "/chat/completions", body: Buffer.from(JSON.stringify(body)), stream });
+      inFlight++;
+      try {
+        return await forward(req, res, { suffix: "/chat/completions", body: Buffer.from(JSON.stringify(body)), stream });
+      } finally {
+        inFlight--;
+        if (state.backend) { state.backend.lastUsedAt = new Date().toISOString(); saveState(); }
+      }
     }
 
     if (req.method === "POST" && p === "/v1/completions") {
@@ -672,7 +680,10 @@ const server = http.createServer(async (req, res) => {
       let body; try { body = JSON.parse(raw.toString()); } catch { return openAiError(res, 400, "invalid JSON", "invalid_request_error"); }
       if (cfg.forceModel) body.model = cfg.servedModel;
       state.counters.requests++;
-      return forward(req, res, { suffix: "/completions", body: Buffer.from(JSON.stringify(body)), stream: body.stream === true });
+      const stream = body.stream === true;
+      inFlight++;
+      try { return await forward(req, res, { suffix: "/completions", body: Buffer.from(JSON.stringify(body)), stream }); }
+      finally { inFlight--; if (state.backend) { state.backend.lastUsedAt = new Date().toISOString(); saveState(); } }
     }
 
     if (req.method === "POST" && p === "/v1/messages" && cfg.allowAnthropic) {
@@ -680,7 +691,10 @@ const server = http.createServer(async (req, res) => {
       let body; try { body = JSON.parse(raw.toString()); } catch { return openAiError(res, 400, "invalid JSON", "invalid_request_error"); }
       if (cfg.forceModel) body.model = cfg.servedModel;
       state.counters.requests++;
-      return forward(req, res, { suffix: "/messages", body: Buffer.from(JSON.stringify(body)), stream: body.stream === true, anthropic: true });
+      const stream = body.stream === true;
+      inFlight++;
+      try { return await forward(req, res, { suffix: "/messages", body: Buffer.from(JSON.stringify(body)), stream, anthropic: true }); }
+      finally { inFlight--; if (state.backend) { state.backend.lastUsedAt = new Date().toISOString(); saveState(); } }
     }
 
     openAiError(res, 404, `no route ${req.method} ${p}`, "not_found");
