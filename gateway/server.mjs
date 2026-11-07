@@ -334,8 +334,34 @@ async function boot() {
   throw new BootError("all accounts failed to boot", { step: "boot" });
 }
 
+async function adoptBoot() {
+  const b = state.backend;
+  const account = loadAccounts().find((a) => a.name === b.account);
+  if (!account) throw new BootError(`unknown account ${b.account}`, { account: b.account });
+  log(`adopting in-flight boot ${b.kernel} (pushed ${b.pushedAt})`);
+  const ready = await waitForReady(account, { kernel: b.kernel, topic: b.topic }, (ev) => {
+    if (state.backend && ev.phase) { state.backend.phase = ev.phase; saveState(); }
+  });
+  state.backend.status = "live";
+  state.backend.endpoint = ready.endpoint.replace(/\/+$/, "");
+  state.backend.readyAt = new Date().toISOString();
+  state.backend.lastUsedAt = new Date().toISOString();
+  state.backend.phase = "ready";
+  state.backend.startupSeconds = ready.startup_secs ?? null;
+  saveState();
+  accountState.set(account.name, { ...(accountState.get(account.name) || {}), lastBootAt: new Date().toISOString(), lastError: null });
+  log(`live at ${state.backend.endpoint} (startup ${ready.startup_secs ?? "?"} s)`);
+  return state.backend;
+}
+
 async function ensureBackend() {
   if (state.backend?.status === "live") return state.backend;
+  // a gateway restart must not orphan (and re-push) a kernel already in Kaggle's queue
+  if (state.backend?.status === "booting" && state.backend.kernel && state.backend.topic
+      && Date.now() - Date.parse(state.backend.pushedAt) < cfg.bootTimeoutMinutes * 60000) {
+    if (!booting) booting = adoptBoot().finally(() => { booting = null; });
+    return booting;
+  }
   if (!booting) booting = boot().finally(() => { booting = null; });
   return booting;
 }

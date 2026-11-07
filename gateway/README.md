@@ -125,6 +125,17 @@ chips), and projects token capacity with the recipe's measured throughput
 (~130 tok/s single stream, ~540 tok/s at eight streams). The `ledger` section
 records every gateway-driven session with its billable and serving seconds.
 
+The same report without the server:
+
+```bash
+node gateway/compute.mjs          # table + totals
+node gateway/compute.mjs --json   # machine-readable
+```
+
+It separates the **nominal** allowance (every account, 30 GPU-h + 20 TPU-h each)
+from what is **claimable today** (TPU-verified accounts only) and the hours
+**locked** behind missing TPU verification.
+
 The gateway only counts a session as billable from **push** (the moment Kaggle
 starts provisioning) to **delete**, because that is what Kaggle charges — the
 cold start included, not just the time the endpoint was live.
@@ -134,6 +145,8 @@ cold start included, not just the time the endpoint was live.
 | File | Committed | Purpose |
 |---|---|---|
 | `server.mjs` | yes | the gateway |
+| `compute.mjs` | yes | quota / "compute secured" report |
+| `smoke.mjs` | yes | end-to-end check (models, stream, non-stream, status) |
 | `accounts.example.json` | yes | token registry template |
 | `config.example.json` | yes | defaults |
 | `accounts.local.json` | **no** | your KGAT tokens |
@@ -146,6 +159,8 @@ cold start included, not just the time the endpoint was live.
 
 * One live session per account; the gateway runs one backend at a time and
   fails over only when an account cannot boot.
+* A gateway restart does not orphan a queued kernel: if a boot is in flight it
+  is adopted (same kernel and ntfy topic) instead of pushed again.
 * Kaggle can refuse a TPU at peak times (`QUEUED` for a long while) or hand out
   a session without one. Both are Kaggle-side and retried on the next account.
 * The tunnel URL and the kernel's own API key are regenerated on every push;
