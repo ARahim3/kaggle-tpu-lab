@@ -1,0 +1,22 @@
+{
+  "host": "127.0.0.1",
+  "port": 9790,
+  "pythonBin": "python3",
+  "model": "qwen38-27b",
+  "servedModel": "qwen3.8-27b",
+  "slug": "ktl-qwen-gw",
+  "idleMinutes": 10,
+  "maxSessionMinutes": 530,
+  "bootTimeoutMinutes": 45,
+  "bootWaitSeconds": 600,
+  "forceModel": true,
+  "textOnly": false,
+  "fastStart": true,
+  "maxModelLen": 262144,
+  "maxNumSeqs": 4,
+  "mtp": 3,
+  "reasoningEffort": "low",
+  "allowAnthropic": true,
+  "assumedTokPerSecSingle": 130,
+  "assumedTokPerSecAggregate": 540
+}
