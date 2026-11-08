@@ -189,6 +189,7 @@ def prepare(args):
             "is_private": "true",
             "enable_gpu": "false",
             "enable_tpu": "true",
+            "machine_shape": "TpuV5E8",
             "enable_internet": "true",
             "dataset_sources": datasets,
             "competition_sources": [], "kernel_sources": [], "model_sources": [],

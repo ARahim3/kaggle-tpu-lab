@@ -60,6 +60,14 @@ The first start prints the local API key and writes it to
 > The gateway catches that (`failed step=no-tpu`), marks the account
 > `tpuEligible: false`, and moves on. Verify the phone on
 > kaggle.com/settings to unlock that account's 20 h.
+>
+> A separate account-level limit is worth knowing: **one batch TPU session per
+> account**. A queued kernel from an earlier push keeps that slot, and the next
+> push fails with `Maximum batch TPU session count of 1 reached`. The gateway
+> deletes the old `slug` before pushing, which frees it. A session that stays
+> `QUEUED` for hours while GPU pushes on the same account run in a minute is
+> Kaggle not scheduling the TPU (eligibility or capacity), not a gateway fault;
+> nothing is billed while it waits.
 
 ## Use it
 

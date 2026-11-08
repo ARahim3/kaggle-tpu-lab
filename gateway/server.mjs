@@ -199,8 +199,24 @@ async function pushKernel(account) {
   if (cfg.fastStart) args.push("--fast-start");
 
   log(`pushing ${account.username}/${cfg.slug} (${cfg.model})`);
+
+  // A stale kernel from an earlier push holds the account's single batch-TPU
+  // session slot ("Maximum batch TPU session count of 1 reached"), so clear it
+  // first. A live backend is never booted over: ensureBackend only gets here
+  // when there is no live endpoint.
+  try { await kaggleCli(account, ["kernels", "delete", `${account.username}/${cfg.slug}`], { input: "yes\n", timeoutMs: 120000 }); } catch {}
+  await sleep(2000);
+
   const r = await run(cfg.pythonBin, args, { env: accountEnv(account), timeoutMs: 20 * 60 * 1000 });
-  if (r.code !== 0) throw new BootError(`push failed: ${(r.all || "").slice(-600)}`, { account: account.name });
+  if (r.code !== 0) {
+    const tooMany = /Maximum batch TPU session count/i.test(r.all || "");
+    throw new BootError(
+      tooMany
+        ? `account ${account.name} still holds a TPU session slot (${(r.all || "").slice(-300)})`
+        : `push failed: ${(r.all || "").slice(-600)}`,
+      { account: account.name },
+    );
+  }
 
   const m = (r.all || "").match(/KERNEL_STATE=(\{[^\n]*\})/);
   if (m) { try { return JSON.parse(m[1]); } catch {} }
