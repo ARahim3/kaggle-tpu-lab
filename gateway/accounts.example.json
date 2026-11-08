@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "name": "primary",
+      "username": "your-kaggle-username",
+      "token": "KGAT_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "tpuEligible": true
+    },
+    {
+      "name": "second",
+      "username": "another-kaggle-account",
+      "token": "KGAT_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "tpuEligible": true
+    }
+  ]
+}

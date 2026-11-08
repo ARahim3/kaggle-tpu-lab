@@ -49,6 +49,19 @@ python launch.py serve            # Qwen3.8-27B today; --model picks another rec
 `launch.py` pushes the kernel with the Kaggle CLI and follows its progress; `status`
 and `stop` do what they say.
 
+## On demand: the gateway
+
+A session burns quota while it idles. [`gateway/`](gateway/) is a small
+OpenAI-compatible front that keeps the model **cold**, pushes the Qwen kernel on
+the first request, streams through the tunnel, and deletes the kernel after ten
+minutes of silence (and at the nine-hour cap). One stable local key, failover
+across several Kaggle accounts, and a live quota/compute report:
+
+```bash
+node gateway/server.mjs            # http://127.0.0.1:9790/v1, key in gateway/state.local.json
+curl -s localhost:9790/v1/admin/status -H "Authorization: Bearer $KEY" | jq .compute
+```
+
 ## On a Google Cloud TPU VM
 
 The GLM-5.3-Flash recipe also runs on a rented TPU VM, the same machine as Kaggle's (`v5litepod-8`) or a `v6e-8`,

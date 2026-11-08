@@ -1,0 +1,6 @@
+accounts.local.json
+config.local.json
+state.local.json
+.kgcfg/
+.work/
+*.log

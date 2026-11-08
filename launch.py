@@ -108,7 +108,19 @@ def engine_b64(pkg_dir):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def cmd_serve(args):
+def write_state(args, state):
+    path = Path(args.state).expanduser() if getattr(args, "state", None) else STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=1))
+    return path
+
+
+def prepare(args):
+    """Build the kernel from the chosen recipe, push it, and return its state.
+
+    Shared by `serve` (which then watches) and `push` (which just prints the
+    state and exits, so a supervisor can own the lifecycle).
+    """
     check_auth()
     user = kaggle_username(args.user)
     model = MODELS[args.model]
@@ -177,6 +189,7 @@ def cmd_serve(args):
             "is_private": "true",
             "enable_gpu": "false",
             "enable_tpu": "true",
+            "machine_shape": "TpuV5E8",
             "enable_internet": "true",
             "dataset_sources": datasets,
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
@@ -191,13 +204,27 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
+    state = {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key,
+             "model": model["model_name"], "username": user,
+             "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write_state(args, state)
+    return state
+
+
+def cmd_push(args):
+    """Push the kernel and print its state as one JSON line. No watch loop: whoever
+    called us (the gateway) follows the ntfy topic and owns stop/idle/expiry."""
+    state = prepare(args)
+    print("KERNEL_STATE=" + json.dumps(state), flush=True)
+
+
+def cmd_serve(args):
+    state = prepare(args)
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
-        f"datasets; the endpoint is usually live ~{model['minutes']} min after the kernel starts.")
+        f"datasets; the endpoint is usually live ~{MODELS[args.model]['minutes']} min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    watch(state["kernel"], state["topic"])
 
 
 def read_events(topic, since):
@@ -363,40 +390,45 @@ def cmd_build_env(args):
     watch(f"{user}/{args.slug}", topic)
 
 
-def load_state():
-    if not STATE_FILE.exists():
-        sys.exit("No launch state found — run `python launch.py serve` first.")
-    return json.loads(STATE_FILE.read_text())
+def load_state(args=None):
+    path = Path(getattr(args, "state", None)).expanduser() if getattr(args, "state", None) else STATE_FILE
+    if not path.exists():
+        sys.exit(f"No launch state found at {path} — run `python launch.py serve` first.")
+    return json.loads(path.read_text())
+
+
+def state_kernel(args):
+    if getattr(args, "kernel", None):
+        return args.kernel
+    return load_state(args)["kernel"]
 
 
 def cmd_status(args):
-    st = load_state()
+    if getattr(args, "kernel", None):
+        st = {"kernel": args.kernel, "topic": getattr(args, "topic", None), "api_key": ""}
+    else:
+        st = load_state(args)
     say(f"Kernel: {st['kernel']}")
     r = kaggle("kernels", "status", st["kernel"])
     say(((r.stdout or "") + (r.stderr or "")).strip())
-    events = read_events(st["topic"], int(time.time()) - 24 * 3600)
+    events = read_events(st["topic"], int(time.time()) - 24 * 3600) if st.get("topic") else []
     for _, ev in events[-8:]:
         render_event(ev)
-    if any(ev.get("phase") == "ready" for _, ev in events):
+    if st.get("api_key") and any(ev.get("phase") == "ready" for _, ev in events):
         say(f"API key: {st['api_key']}")
-    if args.follow:
+    if args.follow and st.get("topic"):
         watch(st["kernel"], st["topic"])
 
 
 def cmd_stop(args):
-    st = load_state()
-    say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
+    kernel = state_kernel(args)
+    say(f"Deleting kernel {kernel} (terminates the TPU session)...")
     p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+                        kernel], input="yes\n", capture_output=True, text=True)
     say((p.stdout + p.stderr).strip() or "done")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("serve", help="push the serving kernel and watch it come up")
+def add_serve_args(s):
     s.add_argument("--model", default="qwen38-27b", choices=sorted(MODELS), help="which recipe (model folder) to serve")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
     s.add_argument("--slug", default=None, help="kernel name (default: the model's)")
@@ -434,7 +466,24 @@ def main():
                    help="skip TPU graph precompile: endpoint live in ~4 min (with the env "
                         "dataset), common request shapes are warmed right after; an "
                         "unusual request shape stalls ~1 min the first time")
+    s.add_argument("--state", default=None,
+                   help="state file (default ~/.kaggle-tpu-lab.json); use a per-kernel path "
+                        "when several launches must coexist")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve", help="push the serving kernel and watch it come up")
+    add_serve_args(s)
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("push", help="push the serving kernel and print its state as JSON "
+                       "(no watch loop; for a supervisor that owns stop/idle/expiry)")
+    add_serve_args(s)
+    s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "
                        "env dataset: venv + XLA cache + cloudflared")
@@ -445,9 +494,14 @@ def main():
 
     s = sub.add_parser("status", help="show current kernel status + recent events")
     s.add_argument("--follow", "-f", action="store_true", help="keep watching")
+    s.add_argument("--state", default=None, help="state file written by serve/push")
+    s.add_argument("--kernel", default=None, help="kernel ref (skips the state file)")
+    s.add_argument("--topic", default=None, help="ntfy topic for --kernel")
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("stop", help="terminate the TPU session")
+    s.add_argument("--state", default=None, help="state file written by serve/push")
+    s.add_argument("--kernel", default=None, help="kernel ref (skips the state file)")
     s.set_defaults(fn=cmd_stop)
 
     args = ap.parse_args()
