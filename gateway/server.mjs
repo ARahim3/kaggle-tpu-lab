@@ -114,7 +114,14 @@ function loadAccounts() {
   return (j.accounts || []).filter((a) => a && a.token && a.username && a.enabled !== false);
 }
 
-const accountState = new Map(); // name -> { lastBootAt, lastError, tpuEligible }
+const accountState = new Map(Object.entries(state.accountState || {})); // name -> { lastBootAt, lastError, tpuEligible }
+
+function setAccountState(name, patch) {
+  const next = { ...(accountState.get(name) || {}), ...patch };
+  accountState.set(name, next);
+  state.accountState = { ...(state.accountState || {}), [name]: next };
+  saveState();
+}
 
 function accountsView() {
   return loadAccounts().map((a) => ({
@@ -272,7 +279,7 @@ async function pickAccount(exclude = new Set()) {
       const tpuLeft = secs(q.tpuQuota?.totalTimeAllowed) - secs(q.tpuQuota?.timeUsed) - secs(q.tpuQuota?.timeReserved);
       rows.push({ a, tpuLeft, q });
     } catch (e) {
-      accountState.set(a.name, { ...(accountState.get(a.name) || {}), lastError: `quota: ${e.message}` });
+      setAccountState(a.name, { lastError: `quota: ${e.message}` });
     }
   }
   const usable = rows.filter((r) => r.tpuLeft > 600).sort((x, y) => y.tpuLeft - x.tpuLeft);
@@ -319,11 +326,11 @@ async function boot() {
       state.backend.phase = "ready";
       state.backend.startupSeconds = ready.startup_secs ?? null;
       saveState();
-      accountState.set(account.name, { ...(accountState.get(account.name) || {}), lastBootAt: new Date().toISOString(), lastError: null });
+      setAccountState(account.name, { lastBootAt: new Date().toISOString(), lastError: null });
       log(`live at ${state.backend.endpoint} (startup ${ready.startup_secs ?? "?"} s)`);
       return state.backend;
     } catch (e) {
-      accountState.set(account.name, { ...(accountState.get(account.name) || {}), lastError: e.message, ...(e.noTpu ? { tpuEligible: false } : {}) });
+      setAccountState(account.name, { lastError: e.message, ...(e.noTpu ? { tpuEligible: false } : {}) });
       if (e.noTpu) log(`account ${account.name} has no TPU — marked ineligible`);
       try { await kaggleCli(account, ["kernels", "delete", pushed?.kernel || `${account.username}/${cfg.slug}`], { input: "yes\n", timeoutMs: 120000 }); } catch {}
       state.backend = null;
@@ -349,7 +356,7 @@ async function adoptBoot() {
   state.backend.phase = "ready";
   state.backend.startupSeconds = ready.startup_secs ?? null;
   saveState();
-  accountState.set(account.name, { ...(accountState.get(account.name) || {}), lastBootAt: new Date().toISOString(), lastError: null });
+  setAccountState(account.name, { lastBootAt: new Date().toISOString(), lastError: null });
   log(`live at ${state.backend.endpoint} (startup ${ready.startup_secs ?? "?"} s)`);
   return state.backend;
 }
